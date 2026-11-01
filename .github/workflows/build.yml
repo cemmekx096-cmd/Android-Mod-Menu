@@ -9,8 +9,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '11'
-      - run: chmod +x gradlew
-      - run: ./gradlew assembleDebug --stacktrace
+      - name: Baca versi Gradle
+        id: gv
+        run: |
+          V=$(grep distributionUrl gradle/wrapper/gradle-wrapper.properties | sed -E 's/.*gradle-([0-9.]+)-.*/\1/')
+          echo "Versi Gradle: $V"
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.gv.outputs.v }}
+      - run: gradle assembleDebug --stacktrace
       - uses: actions/upload-artifact@v4
         with:
           name: modmenu-apk
