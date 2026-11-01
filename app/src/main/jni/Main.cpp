@@ -17,6 +17,8 @@
 #include "Includes/Macros.h"
 #include "dobby.h"
 
+#define ENABLE_HOOKS 0
+
 bool fCraft = false, fUnlock = false, fProtect = false, fSkill = false;
 
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
@@ -77,7 +79,7 @@ void hack_thread() {
     while (!isLibraryLoaded(targetLibName)) {
         sleep(1);
     }
-#if defined(__aarch64__)
+#if defined(__aarch64__) && ENABLE_HOOKS
     HOOK(targetLibName, "0x265CEFC", IsCraftFree, old_IsCraftFree);
     HOOK(targetLibName, "0x265CF80", IsLongUnlockFree, old_IsLongUnlockFree);
     HOOK(targetLibName, "0x2659004", IsCharProtected, old_IsCharProtected);
