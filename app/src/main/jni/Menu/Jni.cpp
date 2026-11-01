@@ -15,6 +15,7 @@
 #include "Includes/Logger.h"
 
 void Dialog(JNIEnv *env, jobject context, const char *title, const char *message, const char *openBtn, const char *closeBtn, int sec, const char *url) {
+    return; // dialog dimatikan: context Service tidak punya window token
     jclass dialogHelperClass = env->FindClass(OBFUSCATE("com/android/support/DialogHelper"));
     jmethodID showMethod = env->GetStaticMethodID(dialogHelperClass, OBFUSCATE("showDialogWithLink"),
                                                   OBFUSCATE("(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;)V"));
