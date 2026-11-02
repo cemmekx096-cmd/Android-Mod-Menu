@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <initializer_list>
 #include <set>
 #include <unordered_set>
@@ -26,6 +27,7 @@
 
 #define targetLibName OBFUSCATE("libil2cpp.so")
 #define OUT_DIR "/data/data/ocean.nomad.survival.simulator/files"
+#define ONCE(msg) { static bool _o = false; if (!_o) { _o = true; LOGI(OBFUSCATE(msg)); } }
 
 // ---------- toggle cheat (ECheatKey) ----------
 std::atomic<unsigned int> cheatMask(0);
@@ -48,11 +50,27 @@ static void setKeys(std::initializer_list<int> keys, bool on) {
     }
 }
 
+// ---------- toast ----------
+static void showToast(JNIEnv *env, jobject ctx, const char *text) {
+    if (!env || !ctx) return;
+    jstring js = env->NewStringUTF(text);
+    jclass toast = env->FindClass(OBFUSCATE("android/widget/Toast"));
+    jmethodID mk = env->GetStaticMethodID(toast, OBFUSCATE("makeText"), OBFUSCATE("(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;"));
+    jobject t = env->CallStaticObjectMethod(toast, mk, ctx, js, 1);
+    jmethodID show = env->GetMethodID(toast, OBFUSCATE("show"), OBFUSCATE("()V"));
+    env->CallVoidMethod(t, show);
+}
+
 // ---------- mode debug ----------
 static void *g_pbm = nullptr, *g_db = nullptr;
 static std::atomic<int> pending(0);
+static std::atomic<bool> g_tick(false);
+static std::atomic<int> g_dumps(0);
 static std::set<std::string> seenUids;
 static std::unordered_set<void *> seenPtr;
+static std::mutex gMtx;
+static void *g_conts[64];
+static int g_nc = 0;
 
 static std::string readStr(void *s) {
     std::string r;
@@ -65,10 +83,21 @@ static std::string readStr(void *s) {
 }
 
 static void noteUid(void *s) {
-    if (!s || seenPtr.size() > 20000 || seenPtr.count(s)) return;
+    if (!s) return;
+    std::lock_guard<std::mutex> lk(gMtx);
+    if (seenPtr.size() > 20000 || seenPtr.count(s)) return;
     seenPtr.insert(s);
     std::string u = readStr(s);
     if (!u.empty()) seenUids.insert(u);
+}
+
+static void noteContainer(void *c) {
+    static void *last = nullptr;
+    if (!c || c == last) return;
+    last = c;
+    std::lock_guard<std::mutex> lk(gMtx);
+    for (int i = 0; i < g_nc; i++) if (g_conts[i] == c) return;
+    if (g_nc < 64) g_conts[g_nc++] = c;
 }
 
 static void *containerStorage(void *sc) {
@@ -111,22 +140,48 @@ static void doDumpInventory() {
     FILE *f = fopen(OUT_DIR "/inv_dump.txt", "w");
     if (!f) { LOGI(OBFUSCATE("gagal membuka inv_dump.txt")); return; }
     fprintf(f, "# label|uid|icon|kind|jumlah\n");
-    if (!g_pbm) {
+    std::vector<void *> done;
+    auto fresh = [&](void *s) -> bool {
+        if (!s) return false;
+        for (void *d : done) if (d == s) return false;
+        done.push_back(s);
+        return true;
+    };
+    if (g_pbm) {
+        void *st[3] = {containerStorage(*(void **) ((char *) g_pbm + 0x48)),
+                       containerStorage(*(void **) ((char *) g_pbm + 0x50)),
+                       containerStorage(*(void **) ((char *) g_pbm + 0x58))};
+        const char *nm[3] = {"backpack", "belt", "equipment"};
+        for (int i = 0; i < 3; i++) if (fresh(st[i])) dumpStorage(f, st[i], nm[i]);
+        auto getTab = (void *(*)(void *, int, void *)) getAbsoluteAddress(targetLibName, "0x2648AD0");
+        for (int i = 0; i < 3; i++) {
+            char lb[16];
+            snprintf(lb, sizeof lb, "tab%d", i);
+            void *s = getTab(g_pbm, i, nullptr);
+            if (fresh(s)) dumpStorage(f, s, lb);
+        }
+    } else {
         fprintf(f, "# PlayerBackpacksManager belum tertangkap\n");
-        fclose(f);
-        return;
     }
-    dumpStorage(f, containerStorage(*(void **) ((char *) g_pbm + 0x48)), "backpack");
-    dumpStorage(f, containerStorage(*(void **) ((char *) g_pbm + 0x50)), "belt");
-    dumpStorage(f, containerStorage(*(void **) ((char *) g_pbm + 0x58)), "equipment");
-    auto getTab = (void *(*)(void *, int, void *)) getAbsoluteAddress(targetLibName, "0x2648AD0");
-    for (int i = 0; i < 3; i++) {
-        char lb[16];
-        snprintf(lb, sizeof lb, "tab%d", i);
-        dumpStorage(f, getTab(g_pbm, i, nullptr), lb);
+    int n = 0;
+    void *snap[64];
+    {
+        std::lock_guard<std::mutex> lk(gMtx);
+        n = g_nc;
+        memcpy(snap, g_conts, sizeof(void *) * n);
     }
+    for (int i = 0; i < n; i++) {
+        void *s = containerStorage(snap[i]);
+        if (fresh(s)) {
+            char lb[16];
+            snprintf(lb, sizeof lb, "cont%d", i);
+            dumpStorage(f, s, lb);
+        }
+    }
+    fprintf(f, "# kontainer tertangkap: %d\n", n);
     fclose(f);
-    LOGI(OBFUSCATE("inv_dump selesai"));
+    g_dumps++;
+    LOGI(OBFUSCATE("inv_dump selesai, kontainer=%d"), n);
 }
 
 static void doDumpDb() {
@@ -152,9 +207,13 @@ static void doDumpDb() {
             }
         } else fprintf(f, "# GetData tidak ditemukan\n");
     } else fprintf(f, "# database belum tertangkap\n");
-    fprintf(f, "# --- uid yang pernah dicari game (%zu) ---\n", seenUids.size());
-    for (auto &u : seenUids) fprintf(f, "%s\n", u.c_str());
+    {
+        std::lock_guard<std::mutex> lk(gMtx);
+        fprintf(f, "# --- uid yang pernah dicari game (%zu) ---\n", seenUids.size());
+        for (auto &u : seenUids) fprintf(f, "%s\n", u.c_str());
+    }
     fclose(f);
+    g_dumps++;
     LOGI(OBFUSCATE("db_dump selesai"));
 }
 
@@ -164,30 +223,55 @@ static void runPending() {
     if (p & 2) doDumpDb();
 }
 
+void (*old_Tick)(void *, void *);
+void hk_Tick(void *self, void *mi) {
+    ONCE("hook Tick aktif")
+    g_tick = true;
+    runPending();
+    old_Tick(self, mi);
+}
+int (*old_Count)(void *, void *, void *);
+int hk_Count(void *self, void *uid, void *mi) {
+    ONCE("hook Count aktif")
+    noteContainer(self);
+    return old_Count(self, uid, mi);
+}
+bool (*old_Enough)(void *, void *, void *);
+bool hk_Enough(void *self, void *recipe, void *mi) {
+    ONCE("hook IsEnoughResources aktif")
+    noteContainer(self);
+    return old_Enough(self, recipe, mi);
+}
+void *(*old_SelBackpack)(void *, void *);
+void *hk_SelBackpack(void *self, void *mi) {
+    ONCE("hook SelectedBackpack aktif")
+    if (self) g_pbm = self;
+    return old_SelBackpack(self, mi);
+}
 int (*old_FreeCells)(void *, void *);
 int hk_FreeCells(void *self, void *mi) {
+    ONCE("hook FreeCells aktif")
     if (self) g_pbm = self;
-    runPending();
     return old_FreeCells(self, mi);
 }
 int (*old_AmountThing)(void *, void *, void *);
 int hk_AmountThing(void *self, void *thing, void *mi) {
+    ONCE("hook AmountThing aktif")
     if (self) g_pbm = self;
-    runPending();
     return old_AmountThing(self, thing, mi);
 }
 void *(*old_Get)(void *, void *, void *);
 void *hk_Get(void *db, void *t, void *mi) {
+    ONCE("hook Get aktif")
     if (db) g_db = db;
     noteUid(t);
-    runPending();
     return old_Get(db, t, mi);
 }
 bool (*old_TryGet)(void *, void *, void *, void *);
 bool hk_TryGet(void *db, void *t, void *out, void *mi) {
+    ONCE("hook TryGet aktif")
     if (db) g_db = db;
     noteUid(t);
-    runPending();
     return old_TryGet(db, t, out, mi);
 }
 
@@ -195,10 +279,15 @@ static bool dbgHooked = false;
 static void installDebug() {
     if (dbgHooked) return;
     dbgHooked = true;
+    HOOK(targetLibName, "0x25788E8", hk_Tick, old_Tick);
+    HOOK(targetLibName, "0x27C1910", hk_Count, old_Count);
+    HOOK(targetLibName, "0x27C1D6C", hk_Enough, old_Enough);
+    HOOK(targetLibName, "0x2647140", hk_SelBackpack, old_SelBackpack);
     HOOK(targetLibName, "0x2648D00", hk_FreeCells, old_FreeCells);
     HOOK(targetLibName, "0x2647348", hk_AmountThing, old_AmountThing);
     HOOK(targetLibName, "0x23DE354", hk_Get, old_Get);
     HOOK(targetLibName, "0x23DE3FC", hk_TryGet, old_TryGet);
+    LOGI(OBFUSCATE("hook debug terpasang"));
 }
 
 // ---------- menu ----------
@@ -217,7 +306,8 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("Category_Debug"),
             OBFUSCATE("Button_Siapkan (pasang hook)"),
             OBFUSCATE("Button_Dump inventory"),
-            OBFUSCATE("Button_Dump database item")
+            OBFUSCATE("Button_Dump database item"),
+            OBFUSCATE("Button_Status (cek tangkapan)")
     };
     int Total_Feature = (sizeof features / sizeof features[0]);
     ret = (jobjectArray) env->NewObjectArray(Total_Feature, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
@@ -237,9 +327,30 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
         case 6: setKeys({12}, boolean); break;
         case 7: setKeys({3}, boolean); break;
         case 8: setKeys({11}, boolean); break;
-        case 9: installDebug(); break;
-        case 10: pending |= 1; break;
-        case 11: pending |= 2; break;
+        case 9:
+            installDebug();
+            showToast(env, obj, "Hook debug dipasang");
+            break;
+        case 10:
+            pending |= 1;
+            showToast(env, obj, "Dump inventory diminta");
+            LOGI(OBFUSCATE("tombol dump inventory ditekan"));
+            break;
+        case 11:
+            pending |= 2;
+            showToast(env, obj, "Dump database diminta");
+            LOGI(OBFUSCATE("tombol dump database ditekan"));
+            break;
+        case 12: {
+            char b[160];
+            int nc;
+            { std::lock_guard<std::mutex> lk(gMtx); nc = g_nc; }
+            snprintf(b, sizeof b, "hook=%d tick=%d pbm=%d db=%d kontainer=%d dump=%d",
+                     dbgHooked ? 1 : 0, g_tick.load() ? 1 : 0, g_pbm ? 1 : 0, g_db ? 1 : 0, nc, g_dumps.load());
+            showToast(env, obj, b);
+            LOGI(OBFUSCATE("status: %s"), b);
+            break;
+        }
         default: break;
     }
 }
