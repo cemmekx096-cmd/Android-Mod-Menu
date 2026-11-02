@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cerrno>
 #include <cstdarg>
+#include <cstdlib>
 #include <ctime>
 #include <pthread.h>
 #include <thread>
@@ -71,6 +72,35 @@ static std::string g_lastFile;
 static std::atomic<uint64_t> g_seenCache[4096];
 static std::map<std::string, uintptr_t> g_caller;  // uid -> alamat pemanggil pertama (kode game yang melakukan lookup)
 static thread_local bool tlSkip = false;      // true saat kita sendiri yang memanggil TryGet (verifikasi), supaya tidak tercatat
+
+// ---------- input runtime dari menu ----------
+static std::mutex gAddMtx;
+static std::string g_manualUid;               // diisi lewat InputText_ di menu
+static int g_manualAmount = 1;                // diisi lewat InputValue_ di menu
+static std::string g_addMsg = "-";
+
+static std::string getManualUid() {
+    std::lock_guard<std::mutex> lk(gAddMtx);
+    return g_manualUid;
+}
+static int getManualAmount() {
+    std::lock_guard<std::mutex> lk(gAddMtx);
+    return g_manualAmount;
+}
+static void setManualUid(const char *s) {
+    std::lock_guard<std::mutex> lk(gAddMtx);
+    g_manualUid = s ? s : "";
+}
+static void setManualAmount(int n) {
+    std::lock_guard<std::mutex> lk(gAddMtx);
+    if (n < 1) n = 1;
+    if (n > 999999) n = 999999;
+    g_manualAmount = n;
+}
+static void setAddMsg(const char *m) {
+    std::lock_guard<std::mutex> lk(gAddMtx);
+    g_addMsg = m ? m : "-";
+}
 
 static std::string outDir() {
     std::lock_guard<std::mutex> lk(gMtx);
@@ -442,24 +472,15 @@ static void doDumpDb() {
     doVerifyUids();
 }
 
-// ---------- Tambah item: UID manual + jumlah hardcoded ----------
-// Ganti nilai UID dan jumlah di bawah ini sebelum build.
-static const char kManualUid[] = "ISI_UID_DI_SINI";
-static constexpr int kManualAmount = 10;
-static std::string g_addMsg = "-";
-
-static void setAddMsg(const char *m) {
-    std::lock_guard<std::mutex> lk(gMtx);
-    g_addMsg = m;
-}
-
+// ---------- Tambah item: UID & jumlah diisi runtime dari menu ----------
 static void doAddItem() {
-    const char *uid = kManualUid;
-    const int cnt = kManualAmount;
+    std::string uidStr = getManualUid();
+    const char *uid = uidStr.c_str();
+    const int cnt = getManualAmount();
 
-    if (!uid || !uid[0] || strcmp(uid, "ISI_UID_DI_SINI") == 0 || cnt < 1) {
-        fileLog("add: UID belum diisi atau jumlah tidak valid");
-        setAddMsg("GAGAL: isi kManualUid dan periksa kManualAmount");
+    if (uidStr.empty() || cnt < 1) {
+        fileLog("add: UID belum diisi dari menu atau jumlah tidak valid");
+        setAddMsg("GAGAL: isi UID & jumlah di menu dulu");
         return;
     }
 
@@ -502,13 +523,13 @@ static void doAddItem() {
         fileLog("add: Put(backpack %p) -> %d", bp, ok ? 1 : 0);
     }
 
-    char msg[192];
+    char msg[224];
     snprintf(msg, sizeof msg, "%s %d x %s", ok ? "OK" : "GAGAL (tas penuh/UID tidak valid?)", cnt, uid);
     setAddMsg(msg);
 }
 
 // ---------- Verifikasi uid (dipanggil dari Dump database item) ----------
-// Untuk tiap uid (yang pernah dicari game + yang ada di menu Tambah item), kita panggil sendiri
+// Untuk tiap uid (yang pernah dicari game + yang diisi di menu Tambah item), kita panggil sendiri
 // ItemDatabaseExtensions.TryGet(db, uid, out item) dan periksa:
 //   OK          = item ditemukan DAN Item.Uid sama dengan uid yang kita kirim  -> uid asli, aman dipakai Add item
 //   UID_BEDA:x  = item ditemukan tapi Item.Uid = x  -> yang kita pegang ternyata alias/nama, bukan uid asli
@@ -535,8 +556,11 @@ static void doVerifyUids() {
         all = seenUids;
         callers = g_caller;
     }
-    menu.insert(kManualUid);
-    all.insert(kManualUid);
+    std::string mu = getManualUid();
+    if (!mu.empty()) {
+        menu.insert(mu);
+        all.insert(mu);
+    }
     int nOk = 0, nBeda = 0, nNo = 0, nRaw = 0;
     std::vector<std::string> menuBad, raws;
     tlSkip = true;
@@ -759,10 +783,17 @@ static int installAll(const char **summary) {
 }
 
 // ---------- menu minimal ----------
+// Index featNum HARUS konsisten dengan Changes():
+//   0 = tombol Siapkan
+//   1 = InputText  UID item
+//   2 = InputValue Jumlah item
+//   3 = tombol Tambahkan UID ke tas
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     const char *features[] = {
         OBFUSCATE("Button_Siapkan (8 hooks + dump inventory & database)"),
-        OBFUSCATE("Button_Panggil UID dan masukkan ke tas")
+        OBFUSCATE("InputText_UID item (string)"),
+        OBFUSCATE("InputValue_Jumlah item (angka)"),
+        OBFUSCATE("Button_Tambahkan UID ke tas")
     };
 
     const int total = (int)(sizeof(features) / sizeof(features[0]));
@@ -775,8 +806,33 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
 
 void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName,
              jint value, jlong Lvalue, jboolean boolean, jstring text) {
+    // ---- featNum 1: input UID (text) ----
+    if (featNum == 1) {
+        if (text) {
+            const char *c = env->GetStringUTFChars(text, nullptr);
+            if (c) {
+                setManualUid(c);
+                fileLog("menu: UID diisi = '%s'", c);
+                env->ReleaseStringUTFChars(text, c);
+            }
+        }
+        return;
+    }
+
+    // ---- featNum 2: input jumlah ----
+    if (featNum == 2) {
+        int n = (int) value;
+        if (n <= 0 && text) {
+            const char *c = env->GetStringUTFChars(text, nullptr);
+            if (c) { n = atoi(c); env->ReleaseStringUTFChars(text, c); }
+        }
+        setManualAmount(n);
+        fileLog("menu: jumlah diisi = %d", getManualAmount());
+        return;
+    }
+
     switch (featNum) {
-        case 0: {
+        case 0: {   // tombol Siapkan
             resolveOutDir(env, obj);
             const char *summary = nullptr;
             fileLog("tombol Siapkan ditekan: mulai memasang 8 hook");
@@ -795,15 +851,19 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
             showToast(env, obj, msg);
             break;
         }
-        case 1: {
-            // Bit 4: jalankan penambahan UID hardcoded pada Tick game berikutnya.
+        case 3: {   // tombol Tambahkan UID
+            std::string uid = getManualUid();
+            int cnt = getManualAmount();
+            if (uid.empty()) {
+                showToast(env, obj, "UID masih kosong. Isi di menu dulu.");
+                fileLog("add: ditolak, uid kosong");
+                break;
+            }
             pending.fetch_or(4);
-            char msg[192];
-            snprintf(msg, sizeof msg, "Permintaan tambah %d x %s dijadwalkan",
-                     kManualAmount, kManualUid);
+            char msg[224];
+            snprintf(msg, sizeof msg, "Dijadwalkan: %d x %s", cnt, uid.c_str());
             showToast(env, obj, msg);
-            fileLog("permintaan tambah UID dijadwalkan: uid=%s jumlah=%d",
-                    kManualUid, kManualAmount);
+            fileLog("permintaan tambah UID dijadwalkan: uid=%s jumlah=%d", uid.c_str(), cnt);
             break;
         }
         default:
