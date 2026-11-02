@@ -38,36 +38,6 @@
 #define USE_EXTERNAL_DIR 0
 #define ONCE(msg) { static bool _o = false; if (!_o) { _o = true; LOGI(OBFUSCATE(msg)); fileLog("%s", msg); } }
 
-// ---------- toggle cheat (ECheatKey) ----------
-std::atomic<unsigned int> cheatMask(0);
-static bool hookedSet = false;
-
-bool (*old_IsSet)(void *self, int key, void *mi) = nullptr;
-bool hk_IsSet(void *self, int key, void *mi) {
-    if (key >= 0 && key < 32 && (cheatMask.load() & (1u << key))) return true;
-    return old_IsSet ? old_IsSet(self, key, mi) : false;
-}
-
-static void setKeys(std::initializer_list<int> keys, bool on) {
-    if (on && !hookedSet) {
-        if (!isLibraryLoaded(targetLibName)) {
-            LOGI(OBFUSCATE("libil2cpp belum termuat, toggle diabaikan"));
-            return;
-        }
-        HOOK(targetLibName, "0x265C5C4", hk_IsSet, old_IsSet);
-        // hanya dianggap terpasang kalau Dobby benar-benar mengisi pointer aslinya
-        hookedSet = (old_IsSet != nullptr);
-        if (!hookedSet) {
-            LOGI(OBFUSCATE("hook IsSet gagal (cek offset 0x265C5C4)"));
-            return;
-        }
-    }
-    for (int k : keys) {
-        if (on) cheatMask |= (1u << k);
-        else cheatMask &= ~(1u << k);
-    }
-}
-
 // ---------- toast ----------
 static void showToast(JNIEnv *env, jobject ctx, const char *text) {
     if (!env || !ctx) return;
@@ -472,84 +442,10 @@ static void doDumpDb() {
     doVerifyUids();
 }
 
-// ---------- Tambah item (Spinner + Input + Button) ----------
-struct AddEntry { const char *uid; const char *label; };
-static const AddEntry kItems[] = {
-    {"Log", "Kayu (Log)"},
-    {"Thatch", "Jerami dedaunan (Thatch)"},
-    {"Trash", "Sampah (Trash)"},
-    {"Clay", "Tanah liat (Clay)"},
-    {"ScrapMetal", "Rongsokan besi (ScrapMetal)"},
-    {"MetalBar", "Batang logam (MetalBar)"},
-    {"Nails", "Paku (Nails)"},
-    {"PlankTreated", "Papan olahan (PlankTreated)"},
-    {"Cloth", "Kain (Cloth)"},
-    {"Coal", "Arang (Coal)"},
-    {"MetalSheets", "Lembaran logam (MetalSheets)"},
-    {"ThickFabric", "Kain tebal (ThickFabric)"},
-    {"SteelRope", "Tali baja (SteelRope)"},
-    {"Lens", "Lensa (Lens)"},
-    {"Glass", "Kaca (Glass)"},
-    {"Rivets", "Paku keling (Rivets)"},
-    {"Wires", "Kabel (Wires)"},
-    {"AluminumSheet", "Lembaran aluminium (AluminumSheet)"},
-    {"AluminumBar", "Batang aluminium (AluminumBar)"},
-    {"AluminumProfile", "Profil aluminium (AluminumProfile)"},
-    {"EnginePart", "Suku cadang mesin (EnginePart)"},
-    {"Glue", "Lem (Glue)"},
-    {"Rubber", "Karet (Rubber)"},
-    {"RubberSheets", "Lembaran karet (RubberSheets)"},
-    {"Plywood", "Kayu lapis (Plywood)"},
-    {"CopperTube", "Pipa tembaga (CopperTube)"},
-    {"AdhesiveTape", "Isolasi (AdhesiveTape)"},
-    {"Bottle", "Botol kosong (Bottle)"},
-    {"WaterBottle2", "Botol air 2 (WaterBottle2)"},
-    {"WaterBottle3", "Botol air 3 (WaterBottle3)"},
-    {"WaterBottle4", "Botol air 4 (WaterBottle4)"},
-    {"WaterBottle5", "Botol air 5 (WaterBottle5)"},
-    {"Plank", "Papan (Plank)"},
-    {"Rope", "Tali (Rope)"},
-    {"CopperBar", "Batang tembaga (CopperBar)"},
-    {"CopperCoil", "Kumparan tembaga (CopperCoil)"},
-    {"CopperSheets", "Lembaran tembaga (CopperSheets)"},
-    {"CopperContacts", "Kontak tembaga (CopperContacts)"},
-    {"Contacts", "Kontak (Contacts)"},
-    {"PlumbumBar", "Batang timbal (PlumbumBar)"},
-    {"Ore", "Bijih (Ore)"},
-    {"AccumulatorBase", "Dasar aki (AccumulatorBase)"},
-    {"Acid", "Asam (Acid)"},
-    {"Spirit", "Spiritus (Spirit)"},
-    {"Powder", "Bubuk (Powder)"},
-    {"YellowPowder", "Bubuk kuning (YellowPowder)"},
-    {"BulletShell", "Selongsong peluru (BulletShell)"},
-    {"SawBlade", "Mata gergaji (SawBlade)"},
-    {"SteeringWheel", "Roda kemudi (SteeringWheel)"},
-    {"PlanePanel", "Panel pesawat (PlanePanel)"},
-    {"Helix", "Helix"},
-    {"SunSpray", "Semprotan sunscreen (SunSpray)"},
-    {"BlackPaint", "Cat hitam (BlackPaint)"},
-    {"BluePaint", "Cat biru (BluePaint)"},
-    {"GreenPaint", "Cat hijau (GreenPaint)"},
-    {"RedPaint", "Cat merah (RedPaint)"},
-    {"WhitePaint", "Cat putih (WhitePaint)"},
-    {"BlueMix", "Campuran biru (BlueMix)"},
-    {"Canned", "Makanan kaleng (Canned)"},
-    {"Banana_palm", "Pisang palem (Banana palm)"},
-    {"Pineapple_palm", "Nanas palem (Pineapple palm)"},
-    {"Coconut", "Kelapa (Coconut)"},
-    {"Potato", "Kentang (Potato)"},
-    {"Tomate", "Tomat (Tomate)"},
-    {"Goji", "Goji"},
-    {"Sugar", "Gula (Sugar)"},
-    {"YellowJuise", "Jus kuning (YellowJuise)"},
-    {"Fish1", "Ikan 1 (Fish1)"},
-    {"Fish2", "Ikan 2 (Fish2)"},
-    {"Fish3", "Ikan 3 (Fish3)"},
-    {"Fish4", "Ikan 4 (Fish4)"},
-    {"Fish5", "Ikan 5 (Fish5)"},
-};
-static const int kItemCount = (int) (sizeof(kItems) / sizeof(kItems[0]));
-static std::atomic<int> g_selIdx(0), g_addCount(1);
+// ---------- Tambah item: UID manual + jumlah hardcoded ----------
+// Ganti nilai UID dan jumlah di bawah ini sebelum build.
+static const char kManualUid[] = "ISI_UID_DI_SINI";
+static constexpr int kManualAmount = 10;
 static std::string g_addMsg = "-";
 
 static void setAddMsg(const char *m) {
@@ -557,48 +453,58 @@ static void setAddMsg(const char *m) {
     g_addMsg = m;
 }
 
-static std::string buildSpinnerList() {
-    std::string r = "Spinner_Pilih item_";
-    for (int i = 0; i < kItemCount; i++) {
-        if (i) r += ",";
-        r += kItems[i].label;
-    }
-    return r;
-}
-
 static void doAddItem() {
-    int idx = g_selIdx.load(), cnt = g_addCount.load();
-    if (idx < 0 || idx >= kItemCount || cnt < 1) {
-        fileLog("add: indeks/jumlah tidak valid idx=%d cnt=%d", idx, cnt);
-        setAddMsg("GAGAL: indeks/jumlah tidak valid");
+    const char *uid = kManualUid;
+    const int cnt = kManualAmount;
+
+    if (!uid || !uid[0] || strcmp(uid, "ISI_UID_DI_SINI") == 0 || cnt < 1) {
+        fileLog("add: UID belum diisi atau jumlah tidak valid");
+        setAddMsg("GAGAL: isi kManualUid dan periksa kManualAmount");
         return;
     }
+
     void *p1 = g_pbm.load(), *p2 = g_pbmFree.load(), *p3 = g_pbmAmt.load();
     void *pbm = p1 ? p1 : (p2 ? p2 : p3);
     if (!pbm) {
         fileLog("add: PlayerBackpacksManager belum tertangkap");
-        setAddMsg("GAGAL: tas belum tertangkap (buka inventory dulu)");
+        setAddMsg("GAGAL: tas belum tertangkap; buka inventory dulu");
         return;
     }
-    const char *uid = kItems[idx].uid;
-    auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");   // il2cpp_string_new
-    auto getLarge = (void *(*)(void *, void *)) getAbsoluteAddress(targetLibName, "0x2646A0C"); // PlayerBackpacksManager.GetLargeBackpack
-    auto put = (bool (*)(void *, void *, int, int, void *)) getAbsoluteAddress(targetLibName, "0x27C0354"); // StackContainer.Put(ThingType,int,int)
+
+    auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");
+    auto getLarge = (void *(*)(void *, void *)) getAbsoluteAddress(targetLibName, "0x2646A0C");
+    auto put = (bool (*)(void *, void *, int, int, void *)) getAbsoluteAddress(targetLibName, "0x27C0354");
+
+    if (!newStr || !getLarge || !put) {
+        fileLog("add: alamat fungsi IL2CPP tidak tersedia");
+        setAddMsg("GAGAL: fungsi IL2CPP tidak tersedia");
+        return;
+    }
+
     void *str = newStr(uid);
-    if (!str) { fileLog("add: il2cpp_string_new gagal"); setAddMsg("GAGAL: string"); return; }
-    char m[160];
+    if (!str) {
+        fileLog("add: il2cpp_string_new gagal");
+        setAddMsg("GAGAL: pembuatan string UID");
+        return;
+    }
+
     void *cont = getLarge(pbm, nullptr);
     fileLog("add: uid=%s jumlah=%d pbm=%p large=%p", uid, cnt, pbm, cont);
+
     bool ok = false;
     if (cont) ok = put(cont, str, cnt, 0, nullptr);
     fileLog("add: Put(large) -> %d", ok ? 1 : 0);
+
+    // Fallback ke field backpack yang sudah dipakai versi sebelumnya.
     if (!ok) {
         void *bp = fieldPtr(pbm, 0x48);
         if (bp) ok = put(bp, str, cnt, 0, nullptr);
         fileLog("add: Put(backpack %p) -> %d", bp, ok ? 1 : 0);
     }
-    snprintf(m, sizeof m, "%s %d x %s", ok ? "OK" : "GAGAL (tas penuh?)", cnt, uid);
-    setAddMsg(m);
+
+    char msg[192];
+    snprintf(msg, sizeof msg, "%s %d x %s", ok ? "OK" : "GAGAL (tas penuh/UID tidak valid?)", cnt, uid);
+    setAddMsg(msg);
 }
 
 // ---------- Verifikasi uid (dipanggil dari Dump database item) ----------
@@ -629,7 +535,8 @@ static void doVerifyUids() {
         all = seenUids;
         callers = g_caller;
     }
-    for (int i = 0; i < kItemCount; i++) { menu.insert(kItems[i].uid); all.insert(kItems[i].uid); }
+    menu.insert(kManualUid);
+    all.insert(kManualUid);
     int nOk = 0, nBeda = 0, nNo = 0, nRaw = 0;
     std::vector<std::string> menuBad, raws;
     tlSkip = true;
@@ -697,12 +604,35 @@ static void doVerifyUids() {
 }
 
 static void runPending() {
-    if (!pending.load(std::memory_order_relaxed)) return;
-    int p = pending.exchange(0);
-    fileLog("runPending flags=%d", p);
-    if (p & 1) doDumpInventory();
-    if (p & 2) doDumpDb();
-    if (p & 4) doAddItem();
+    int p = pending.load(std::memory_order_relaxed);
+    if (!p) return;
+
+    // Penambahan item diproses terpisah agar tidak tertahan saat dump masih
+    // menunggu objek database/inventory tertangkap.
+    if (p & 4) {
+        pending.fetch_and(~4);
+        fileLog("runPending: proses tambah UID");
+        doAddItem();
+    }
+
+    p = pending.load(std::memory_order_relaxed);
+    if (!(p & 3)) return;
+
+    // Dump gabungan menunggu sampai kedua objek tertangkap oleh hook.
+    if ((!g_pbm.load() && !g_pbmFree.load() && !g_pbmAmt.load()) || !g_db.load()) {
+        static std::atomic<bool> waitingLogged(false);
+        if (!waitingLogged.exchange(true))
+            fileLog("dump gabungan menunggu capture: pbm=%d db=%d",
+                    (g_pbm.load() || g_pbmFree.load() || g_pbmAmt.load()) ? 1 : 0,
+                    g_db.load() ? 1 : 0);
+        return;
+    }
+
+    int dumpFlags = pending.fetch_and(~3) & 3;
+    if (!dumpFlags) return;
+    fileLog("runPending dumpFlags=%d", dumpFlags);
+    if (dumpFlags & 1) doDumpInventory();
+    if (dumpFlags & 2) doDumpDb();
     fileLog("runPending selesai");
 }
 
@@ -801,147 +731,83 @@ static int hookCount() {
         } \
     } while (0)
 
-// MODE BISECT: tiap tekan "Siapkan" memasang SATU hook berikutnya, supaya ketahuan hook mana yang
-// bikin game crash. Urutan = urutan di bawah.
-static int g_step = 0;
-
-// return: 1 = terpasang, 0 = gagal, -1 = libil2cpp belum termuat, -2 = semua sudah terpasang
-static int installNext(const char **name) {
-    if (!isLibraryLoaded(targetLibName)) return -1;
-    if (g_step >= kHookTotal) return -2;
-    int failed = 0;
-    int s = g_step++;
-    switch (s) {
-        case 0: *name = "Tick 0x2576748";
-            TRY_HOOK("0x2576748", hk_Tick, old_Tick); break;
-        case 1: *name = "Count 0x27C1910";
-            TRY_HOOK("0x27C1910", hk_Count, old_Count); break;
-        case 2: *name = "Enough 0x27C1D6C";
-            TRY_HOOK("0x27C1D6C", hk_Enough, old_Enough); break;
-        case 3: *name = "SelBackpack 0x2647140";
-            TRY_HOOK("0x2647140", hk_SelBackpack, old_SelBackpack); break;
-        case 4: *name = "FreeCells 0x2648D00";
-            TRY_HOOK("0x2648D00", hk_FreeCells, old_FreeCells); break;
-        case 5: *name = "AmountThing 0x2647348";
-            TRY_HOOK("0x2647348", hk_AmountThing, old_AmountThing); break;
-        case 6: *name = "Get 0x23DE354";
-            TRY_HOOK("0x23DE354", hk_Get, old_Get); break;
-        default: *name = "TryGet 0x23DE3FC";
-            TRY_HOOK("0x23DE3FC", hk_TryGet, old_TryGet); break;
+// Satu klik memasang seluruh 8 hook.
+static int installAll(const char **summary) {
+    if (!isLibraryLoaded(targetLibName)) {
+        *summary = "libil2cpp belum termuat";
+        return -1;
     }
-    LOGI(OBFUSCATE("hook step %d/%d %s: terpasang=%d gagal=%d"), g_step, kHookTotal, *name, hookCount(), failed);
+
+    int failed = 0;
+    TRY_HOOK("0x2576748", hk_Tick, old_Tick);
+    TRY_HOOK("0x27C1910", hk_Count, old_Count);
+    TRY_HOOK("0x27C1D6C", hk_Enough, old_Enough);
+    TRY_HOOK("0x2647140", hk_SelBackpack, old_SelBackpack);
+    TRY_HOOK("0x2648D00", hk_FreeCells, old_FreeCells);
+    TRY_HOOK("0x2647348", hk_AmountThing, old_AmountThing);
+    TRY_HOOK("0x23DE354", hk_Get, old_Get);
+    TRY_HOOK("0x23DE3FC", hk_TryGet, old_TryGet);
+
+    const int installed = hookCount();
+    static char result[96];
+    snprintf(result, sizeof result, "hook terpasang %d/%d, gagal=%d",
+             installed, kHookTotal, failed);
+    *summary = result;
+
+    fileLog("installAll selesai: hook=%d/%d gagal=%d", installed, kHookTotal, failed);
     return failed ? 0 : 1;
 }
 
-// ---------- menu ----------
+// ---------- menu minimal ----------
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
-    jobjectArray ret;
-    static std::string spinnerStr;
-    if (spinnerStr.empty()) spinnerStr = buildSpinnerList();
     const char *features[] = {
-            OBFUSCATE("Toggle_Craft semua gratis"),
-            OBFUSCATE("Toggle_Unlock tanpa waktu"),
-            OBFUSCATE("Toggle_Tanpa damage"),
-            OBFUSCATE("Toggle_Tanpa lapar"),
-            OBFUSCATE("Toggle_Tanpa haus"),
-            OBFUSCATE("Toggle_Skill gratis"),
-            OBFUSCATE("Toggle_Gerak cepat"),
-            OBFUSCATE("Toggle_Memancing tidak gagal"),
-            OBFUSCATE("Toggle_Berenang bebas"),
-            OBFUSCATE("Category_Debug"),
-            OBFUSCATE("Button_Siapkan (1 hook per klik)"),
-            OBFUSCATE("Button_Dump inventory"),
-            OBFUSCATE("Button_Dump database item"),
-            OBFUSCATE("Button_Status (cek tangkapan)"),
-            OBFUSCATE("Category_Tambah item"),
-            spinnerStr.c_str(),
-            OBFUSCATE("InputValue_999_Jumlah item"),
-            OBFUSCATE("Button_Tambah ke inventory")
+        OBFUSCATE("Button_Siapkan (8 hooks + dump inventory & database)"),
+        OBFUSCATE("Button_Panggil UID dan masukkan ke tas")
     };
-    int Total_Feature = (sizeof features / sizeof features[0]);
-    ret = (jobjectArray) env->NewObjectArray(Total_Feature, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
-    for (int i = 0; i < Total_Feature; i++)
+
+    const int total = (int)(sizeof(features) / sizeof(features[0]));
+    jobjectArray ret = (jobjectArray) env->NewObjectArray(
+        total, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
+    for (int i = 0; i < total; i++)
         env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
-    return (ret);
+    return ret;
 }
 
-void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName, jint value, jlong Lvalue, jboolean boolean, jstring text) {
+void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName,
+             jint value, jlong Lvalue, jboolean boolean, jstring text) {
     switch (featNum) {
-        case 0: setKeys({0}, boolean); break;
-        case 1: setKeys({5, 6}, boolean); break;
-        case 2: setKeys({7}, boolean); break;
-        case 3: setKeys({8}, boolean); break;
-        case 4: setKeys({9}, boolean); break;
-        case 5: setKeys({10}, boolean); break;
-        case 6: setKeys({12}, boolean); break;
-        case 7: setKeys({3}, boolean); break;
-        case 8: setKeys({11}, boolean); break;
-        case 9: {
-            const char *nm = "";
-            fileLog("tombol Siapkan ditekan (step berikutnya=%d)", g_step + 1);
-            int r = installNext(&nm);
-            fileLog("installNext hasil=%d (%s)", r, nm);
-            char b[160];
-            if (r == -1) snprintf(b, sizeof b, "libil2cpp belum termuat, coba lagi sebentar");
-            else if (r == -2) snprintf(b, sizeof b, "Semua %d hook sudah terpasang", kHookTotal);
-            else if (r == 1) snprintf(b, sizeof b, "Hook %d/%d OK: %s\nTunggu 30 detik, kalau aman tekan lagi", g_step, kHookTotal, nm);
-            else snprintf(b, sizeof b, "Hook %d/%d GAGAL: %s", g_step, kHookTotal, nm);
-            showToast(env, obj, b);
-            break;
-        }
-        case 10:
-        case 11: {
+        case 0: {
             resolveOutDir(env, obj);
-            pending |= (featNum == 10 ? 1 : 2);
-            char b[512];
-            snprintf(b, sizeof b, "%s diminta%s\nHasil: %s", featNum == 10 ? "Dump inventory" : "Dump database",
-                     g_tick.load() ? "" : " (hook Tick belum aktif: tekan Siapkan dulu & pastikan sudah di dalam game)",
-                     outDir().c_str());
-            showToast(env, obj, b);
-            LOGI(OBFUSCATE("tombol dump ditekan: %d"), (int) featNum);
-            break;
-        }
-        case 12: {
-            resolveOutDir(env, obj);
-            char b[640];
-            int nc;
-            size_t nu;
-            std::string last, am;
-            {
-                std::lock_guard<std::mutex> lk(gMtx);
-                nc = g_nc;
-                nu = seenUids.size();
-                last = g_lastFile;
-                am = g_addMsg;
+            const char *summary = nullptr;
+            fileLog("tombol Siapkan ditekan: mulai memasang 8 hook");
+            int result = installAll(&summary);
+
+            char msg[256];
+            if (result == -1) {
+                snprintf(msg, sizeof msg, "%s", summary ? summary : "libil2cpp belum termuat");
+            } else {
+                // Bit 1 + 2: inventory dump dan database dump dalam satu pekerjaan.
+                pending.fetch_or(3);
+                snprintf(msg, sizeof msg, "%s. Dump inventory + database dijadwalkan. %s",
+                         summary ? summary : "Hook selesai",
+                         g_tick.load() ? "Menunggu objek tertangkap." : "Menunggu Tick game berjalan.");
             }
-            snprintf(b, sizeof b, "hook=%d/%d tick=%d pbm=%d db=%d kontainer=%d uid=%zu dump=%d baris=%d\nadd: %s\nfile: %s",
-                     hookCount(), kHookTotal, g_tick.load() ? 1 : 0,
-                     (g_pbm.load() || g_pbmFree.load() || g_pbmAmt.load()) ? 1 : 0,
-                     g_db.load() ? 1 : 0, nc, nu, g_dumps.load(), g_rows.load(),
-                     am.c_str(),
-                     last.empty() ? outDir().c_str() : last.c_str());
-            showToast(env, obj, b);
-            LOGI(OBFUSCATE("status: %s"), b);
+            showToast(env, obj, msg);
             break;
         }
-        case 13:
-            g_selIdx = value;
-            fileLog("pilih item idx=%d", (int) value);
-            break;
-        case 14:
-            g_addCount = value < 1 ? 1 : value;
-            break;
-        case 15: {
-            int idx = g_selIdx.load();
-            if (idx < 0 || idx >= kItemCount) idx = 0;
-            pending |= 4;
-            char b[256];
-            snprintf(b, sizeof b, "Tambah %d x %s diminta%s", g_addCount.load(), kItems[idx].label,
-                     g_tick.load() ? "" : "\n(hook Tick belum aktif: tekan Siapkan sampai selesai)");
-            showToast(env, obj, b);
+        case 1: {
+            // Bit 4: jalankan penambahan UID hardcoded pada Tick game berikutnya.
+            pending.fetch_or(4);
+            char msg[192];
+            snprintf(msg, sizeof msg, "Permintaan tambah %d x %s dijadwalkan",
+                     kManualAmount, kManualUid);
+            showToast(env, obj, msg);
+            fileLog("permintaan tambah UID dijadwalkan: uid=%s jumlah=%d",
+                    kManualUid, kManualAmount);
             break;
         }
-        default: break;
+        default:
+            break;
     }
 }
 
