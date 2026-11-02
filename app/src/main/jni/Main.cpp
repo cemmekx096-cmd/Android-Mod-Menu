@@ -28,8 +28,11 @@
 #include "dobby.h"
 
 #define targetLibName OBFUSCATE("libil2cpp.so")
-// fallback kalau getExternalFilesDir gagal (folder ini TIDAK bisa dibaca tanpa root)
+// Folder output dump. HP root: /data/data/... paling gampang.
+// Kalau mau folder yang bisa dibuka tanpa root, ubah USE_EXTERNAL_DIR jadi 1
+// (hasil ke /storage/emulated/0/Android/data/<pkg>/files).
 #define OUT_DIR_FALLBACK "/data/data/ocean.nomad.survival.simulator/files"
+#define USE_EXTERNAL_DIR 0
 #define ONCE(msg) { static bool _o = false; if (!_o) { _o = true; LOGI(OBFUSCATE(msg)); } }
 
 // ---------- toggle cheat (ECheatKey) ----------
@@ -101,6 +104,7 @@ static std::string outDir() {
 
 // Ambil folder yang bisa dibaca user: /storage/emulated/0/Android/data/<pkg>/files
 // (tidak butuh izin storage dan tidak butuh root). Dipanggil dari thread UI (tombol menu).
+#if USE_EXTERNAL_DIR
 static void resolveOutDir(JNIEnv *env, jobject ctx) {
     static bool done = false;
     if (done || !env || !ctx) return;
@@ -125,6 +129,9 @@ static void resolveOutDir(JNIEnv *env, jobject ctx) {
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
+#else
+static void resolveOutDir(JNIEnv *, jobject) {}  // pakai OUT_DIR_FALLBACK (/data/data/...)
+#endif
 
 // Cek apakah memori [p, p+n) bisa dibaca TANPA crash (trik write() ke pipe: EFAULT kalau tidak valid).
 // Hanya dipakai di jalur dump (jarang), bukan di hook yang sering dipanggil.
@@ -467,7 +474,9 @@ static int hookCount() {
 #define TRY_HOOK(H_OFF, H_FN, H_ORIG) \
     do { \
         if (!(H_ORIG)) { \
+            LOGI(OBFUSCATE("memasang hook " H_OFF " (" #H_FN ")")); \
             HOOK(targetLibName, H_OFF, H_FN, H_ORIG); \
+            LOGI(OBFUSCATE("hook selesai " H_OFF)); \
             if (!(H_ORIG)) { failed++; LOGI(OBFUSCATE("hook gagal: " H_OFF)); } \
         } \
     } while (0)

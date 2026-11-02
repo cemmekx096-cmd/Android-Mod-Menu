@@ -22,7 +22,7 @@ void Init(JNIEnv *env, jobject thiz, jobject ctx, jobject title, jobject subtitl
            OBFUSCATE("https://github.com/LGLTeam")); // set nullptr if btn-link is not needed
 
     //Toast Example
-    Toast(env, ctx, OBFUSCATE("Modded by YOU"), ToastLength::LENGTH_LONG);
+    Toast(env, ctx, OBFUSCATE("Modded by kontol"), ToastLength::LENGTH_LONG);
 }
 
 jstring Icon(JNIEnv *env, jobject thiz) {
