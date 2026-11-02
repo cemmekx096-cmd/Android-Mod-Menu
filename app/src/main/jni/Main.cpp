@@ -348,6 +348,28 @@ static FILE *openOut(const char *name) {
     return f;
 }
 
+// Ambil array item dari objek database lewat NAMA FIELD (il2cpp_class_get_field_from_name + il2cpp_field_get_offset),
+// karena method GetData tidak ditemukan di kelas runtime-nya.
+static char *dbArray(FILE *f, void *db) {
+    void *klass = nullptr;
+    if (!rd(db, 0, klass) || !klass) { fprintf(f, "# db: kelas tidak terbaca\n"); fflush(f); return nullptr; }
+    auto getField = (void *(*)(void *, const char *)) getAbsoluteAddress(targetLibName, "0x22227e0");
+    auto fieldOff = (int (*)(void *)) getAbsoluteAddress(targetLibName, "0x2222e5c");
+    const char *names[] = {"Data", "_data", "_items", "Items", "_database", "_list"};
+    for (const char *nm : names) {
+        void *fi = getField(klass, nm);
+        if (!fi) continue;
+        int off = fieldOff(fi);
+        void *arr = fieldPtr(db, (size_t) off);
+        fprintf(f, "# db: field %s offset 0x%x -> %p (kelas %p)\n", nm, off, arr, klass);
+        fflush(f);
+        if (arr) return (char *) arr;
+    }
+    fprintf(f, "# db: tidak ada field Data/_data/_items/Items/_database/_list di kelas %p\n", klass);
+    fflush(f);
+    return nullptr;
+}
+
 static void doDumpInventory() {
     FILE *f = openOut("inv_dump.txt");
     if (!f) return;
@@ -380,6 +402,8 @@ static void doDumpInventory() {
             fprintf(f, "# memanggil GetTab(%d)\n", i);
             fflush(f);
             void *s = getTab(pbm, i, nullptr);
+            fprintf(f, "# GetTab(%d) -> %p\n", i, s);
+            fflush(f);
             if (fresh(s)) dumpStorage(f, s, lb);
         }
     } else {
@@ -413,7 +437,7 @@ static void doDumpDb() {
     fprintf(f, "# uid|icon|kind|stack\n");
     void *db = g_db.load();
     if (db) {
-        char *arr = (char *) invokeNoArg(f, db, "GetData", "db");
+        char *arr = dbArray(f, db);
         long n = 0;
         if (arr) {
             if (!rd(arr, 0x18, n) || n < 0 || n > 100000) {
