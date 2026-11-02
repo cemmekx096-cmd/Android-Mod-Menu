@@ -556,8 +556,8 @@ static int installNext(const char **name) {
     int failed = 0;
     int s = g_step++;
     switch (s) {
-        case 0: *name = "Tick 0x25788E8";
-            TRY_HOOK("0x25788E8", hk_Tick, old_Tick); break;
+        case 0: *name = "Tick 0x2576748";
+            TRY_HOOK("0x2576748", hk_Tick, old_Tick); break;
         case 1: *name = "Count 0x27C1910";
             TRY_HOOK("0x27C1910", hk_Count, old_Count); break;
         case 2: *name = "Enough 0x27C1D6C";
