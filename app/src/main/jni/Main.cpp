@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cerrno>
+#include <cstdarg>
+#include <ctime>
 #include <pthread.h>
 #include <thread>
 #include <atomic>
@@ -33,7 +35,7 @@
 // (hasil ke /storage/emulated/0/Android/data/<pkg>/files).
 #define OUT_DIR_FALLBACK "/data/data/ocean.nomad.survival.simulator/files"
 #define USE_EXTERNAL_DIR 0
-#define ONCE(msg) { static bool _o = false; if (!_o) { _o = true; LOGI(OBFUSCATE(msg)); } }
+#define ONCE(msg) { static bool _o = false; if (!_o) { _o = true; LOGI(OBFUSCATE(msg)); fileLog("%s", msg); } }
 
 // ---------- toggle cheat (ECheatKey) ----------
 std::atomic<unsigned int> cheatMask(0);
@@ -100,6 +102,41 @@ static std::atomic<uint64_t> g_seenCache[4096];
 static std::string outDir() {
     std::lock_guard<std::mutex> lk(gMtx);
     return g_outDir;
+}
+
+// Log ke file (mod_log.txt di folder output). Tiap baris langsung di-write + fsync, jadi kalau game
+// mati mendadak, baris terakhir di file = langkah terakhir yang sempat dijalankan.
+// Mode append: log beberapa sesi (termasuk yang crash) tetap tersimpan. Dipotong kalau > 1 MB.
+static std::mutex gLogMtx;
+static void fileLog(const char *fmt, ...) {
+    char msg[480];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    tm tmv;
+    localtime_r(&ts.tv_sec, &tmv);
+    char line[560];
+    int n = snprintf(line, sizeof line, "%02d:%02d:%02d.%03d [pid %d tid %d] %s\n", tmv.tm_hour, tmv.tm_min,
+                     tmv.tm_sec, (int) (ts.tv_nsec / 1000000), (int) getpid(), (int) gettid(), msg);
+    if (n <= 0) return;
+    if (n > (int) sizeof line - 1) n = (int) sizeof line - 1;
+    std::lock_guard<std::mutex> lk(gLogMtx);
+    std::string dir = outDir();
+    mkdir(dir.c_str(), 0777);
+    std::string path = dir + "/mod_log.txt";
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) return;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz > (1 << 20)) {
+        if (ftruncate(fd, 0) != 0) { /* abaikan */ }
+    }
+    ssize_t w = write(fd, line, (size_t) n);
+    (void) w;
+    fsync(fd);
+    close(fd);
 }
 
 // Ambil folder yang bisa dibaca user: /storage/emulated/0/Android/data/<pkg>/files
@@ -407,14 +444,25 @@ static void doDumpDb() {
 static void runPending() {
     if (!pending.load(std::memory_order_relaxed)) return;
     int p = pending.exchange(0);
+    fileLog("runPending flags=%d", p);
     if (p & 1) doDumpInventory();
     if (p & 2) doDumpDb();
+    fileLog("runPending selesai");
 }
 
 void (*old_Tick)(void *, void *) = nullptr;
 void hk_Tick(void *self, void *mi) {
     ONCE("hook Tick aktif")
     g_tick = true;
+    {   // detak jantung tiap 2 detik: kelihatan berapa lama game bertahan setelah hook dipasang
+        static time_t lastBeat = 0;
+        static int beats = 0;
+        time_t now = time(nullptr);
+        if (now - lastBeat >= 2) {
+            lastBeat = now;
+            fileLog("tick hidup #%d", ++beats);
+        }
+    }
     runPending();
     if (old_Tick) old_Tick(self, mi);
 }
@@ -480,6 +528,8 @@ static int hookCount() {
         for (int i_ = 0; i_ < 6; i_++) if (bp_[i_] == 0xd65f03c0u) { ret_ = i_; break; } \
         LOGI(OBFUSCATE("bytes " H_OFF " @%p: %08x %08x %08x %08x %08x %08x ret@%d"), \
              (const void *) bp_, bp_[0], bp_[1], bp_[2], bp_[3], bp_[4], bp_[5], ret_); \
+        fileLog("bytes " H_OFF " @%p: %08x %08x %08x %08x %08x %08x ret@%d", \
+                (const void *) bp_, bp_[0], bp_[1], bp_[2], bp_[3], bp_[4], bp_[5], ret_); \
     } while (0)
 
 #define TRY_HOOK(H_OFF, H_FN, H_ORIG) \
@@ -487,9 +537,11 @@ static int hookCount() {
         if (!(H_ORIG)) { \
             LOG_BYTES(H_OFF); \
             LOGI(OBFUSCATE("memasang hook " H_OFF " (" #H_FN ")")); \
+            fileLog("MEMASANG hook " H_OFF " (" #H_FN ")  <- kalau game mati setelah baris ini, hook inilah penyebabnya"); \
             HOOK(targetLibName, H_OFF, H_FN, H_ORIG); \
             LOGI(OBFUSCATE("hook selesai " H_OFF)); \
-            if (!(H_ORIG)) { failed++; LOGI(OBFUSCATE("hook gagal: " H_OFF)); } \
+            fileLog("hook selesai " H_OFF " orig=%p", (void *) (H_ORIG)); \
+            if (!(H_ORIG)) { failed++; LOGI(OBFUSCATE("hook gagal: " H_OFF)); fileLog("hook GAGAL " H_OFF); } \
         } \
     } while (0)
 
@@ -564,7 +616,9 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
         case 8: setKeys({11}, boolean); break;
         case 9: {
             const char *nm = "";
+            fileLog("tombol Siapkan ditekan (step berikutnya=%d)", g_step + 1);
             int r = installNext(&nm);
+            fileLog("installNext hasil=%d (%s)", r, nm);
             char b[160];
             if (r == -1) snprintf(b, sizeof b, "libil2cpp belum termuat, coba lagi sebentar");
             else if (r == -2) snprintf(b, sizeof b, "Semua %d hook sudah terpasang", kHookTotal);
@@ -615,6 +669,7 @@ void hack_thread() {
         sleep(1);
     }
     LOGI(OBFUSCATE("Done"));
+    fileLog("libil2cpp termuat, mod siap");
 }
 
 __attribute__((constructor))
