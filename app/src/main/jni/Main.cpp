@@ -471,9 +471,21 @@ static int hookCount() {
 }
 
 // Pasang hook hanya kalau belum terpasang; berhasil kalau Dobby mengisi pointer aslinya
+// Catat 6 instruksi pertama di target SEBELUM di-hook. "ret@N" = fungsi sudah selesai di instruksi ke-N
+// (kalau N < 4, fungsinya lebih pendek dari patch Dobby ~16 byte dan bisa merusak fungsi tetangganya).
+#define LOG_BYTES(H_OFF) \
+    do { \
+        const uint32_t *bp_ = (const uint32_t *) getAbsoluteAddress(targetLibName, H_OFF); \
+        int ret_ = -1; \
+        for (int i_ = 0; i_ < 6; i_++) if (bp_[i_] == 0xd65f03c0u) { ret_ = i_; break; } \
+        LOGI(OBFUSCATE("bytes " H_OFF " @%p: %08x %08x %08x %08x %08x %08x ret@%d"), \
+             (const void *) bp_, bp_[0], bp_[1], bp_[2], bp_[3], bp_[4], bp_[5], ret_); \
+    } while (0)
+
 #define TRY_HOOK(H_OFF, H_FN, H_ORIG) \
     do { \
         if (!(H_ORIG)) { \
+            LOG_BYTES(H_OFF); \
             LOGI(OBFUSCATE("memasang hook " H_OFF " (" #H_FN ")")); \
             HOOK(targetLibName, H_OFF, H_FN, H_ORIG); \
             LOGI(OBFUSCATE("hook selesai " H_OFF)); \
@@ -481,20 +493,36 @@ static int hookCount() {
         } \
     } while (0)
 
-// return: jumlah hook yang gagal, atau -1 kalau libil2cpp belum termuat
-static int installDebug() {
+// MODE BISECT: tiap tekan "Siapkan" memasang SATU hook berikutnya, supaya ketahuan hook mana yang
+// bikin game crash. Urutan = urutan di bawah.
+static int g_step = 0;
+
+// return: 1 = terpasang, 0 = gagal, -1 = libil2cpp belum termuat, -2 = semua sudah terpasang
+static int installNext(const char **name) {
     if (!isLibraryLoaded(targetLibName)) return -1;
+    if (g_step >= kHookTotal) return -2;
     int failed = 0;
-    TRY_HOOK("0x25788E8", hk_Tick, old_Tick);
-    TRY_HOOK("0x27C1910", hk_Count, old_Count);
-    TRY_HOOK("0x27C1D6C", hk_Enough, old_Enough);
-    TRY_HOOK("0x2647140", hk_SelBackpack, old_SelBackpack);
-    TRY_HOOK("0x2648D00", hk_FreeCells, old_FreeCells);
-    TRY_HOOK("0x2647348", hk_AmountThing, old_AmountThing);
-    TRY_HOOK("0x23DE354", hk_Get, old_Get);
-    TRY_HOOK("0x23DE3FC", hk_TryGet, old_TryGet);
-    LOGI(OBFUSCATE("hook debug: terpasang=%d gagal=%d"), hookCount(), failed);
-    return failed;
+    int s = g_step++;
+    switch (s) {
+        case 0: *name = "Tick 0x25788E8";
+            TRY_HOOK("0x25788E8", hk_Tick, old_Tick); break;
+        case 1: *name = "Count 0x27C1910";
+            TRY_HOOK("0x27C1910", hk_Count, old_Count); break;
+        case 2: *name = "Enough 0x27C1D6C";
+            TRY_HOOK("0x27C1D6C", hk_Enough, old_Enough); break;
+        case 3: *name = "SelBackpack 0x2647140";
+            TRY_HOOK("0x2647140", hk_SelBackpack, old_SelBackpack); break;
+        case 4: *name = "FreeCells 0x2648D00";
+            TRY_HOOK("0x2648D00", hk_FreeCells, old_FreeCells); break;
+        case 5: *name = "AmountThing 0x2647348";
+            TRY_HOOK("0x2647348", hk_AmountThing, old_AmountThing); break;
+        case 6: *name = "Get 0x23DE354";
+            TRY_HOOK("0x23DE354", hk_Get, old_Get); break;
+        default: *name = "TryGet 0x23DE3FC";
+            TRY_HOOK("0x23DE3FC", hk_TryGet, old_TryGet); break;
+    }
+    LOGI(OBFUSCATE("hook step %d/%d %s: terpasang=%d gagal=%d"), g_step, kHookTotal, *name, hookCount(), failed);
+    return failed ? 0 : 1;
 }
 
 // ---------- menu ----------
@@ -511,7 +539,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("Toggle_Memancing tidak gagal"),
             OBFUSCATE("Toggle_Berenang bebas"),
             OBFUSCATE("Category_Debug"),
-            OBFUSCATE("Button_Siapkan (pasang hook)"),
+            OBFUSCATE("Button_Siapkan (1 hook per klik)"),
             OBFUSCATE("Button_Dump inventory"),
             OBFUSCATE("Button_Dump database item"),
             OBFUSCATE("Button_Status (cek tangkapan)")
@@ -535,11 +563,13 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
         case 7: setKeys({3}, boolean); break;
         case 8: setKeys({11}, boolean); break;
         case 9: {
-            int failed = installDebug();
-            char b[96];
-            if (failed < 0) snprintf(b, sizeof b, "libil2cpp belum termuat, coba lagi sebentar");
-            else if (failed == 0) snprintf(b, sizeof b, "Hook debug terpasang (%d/%d)", hookCount(), kHookTotal);
-            else snprintf(b, sizeof b, "Hook gagal %d dari %d, cek offset (terpasang %d)", failed, kHookTotal, hookCount());
+            const char *nm = "";
+            int r = installNext(&nm);
+            char b[160];
+            if (r == -1) snprintf(b, sizeof b, "libil2cpp belum termuat, coba lagi sebentar");
+            else if (r == -2) snprintf(b, sizeof b, "Semua %d hook sudah terpasang", kHookTotal);
+            else if (r == 1) snprintf(b, sizeof b, "Hook %d/%d OK: %s\nTunggu 30 detik, kalau aman tekan lagi", g_step, kHookTotal, nm);
+            else snprintf(b, sizeof b, "Hook %d/%d GAGAL: %s", g_step, kHookTotal, nm);
             showToast(env, obj, b);
             break;
         }
