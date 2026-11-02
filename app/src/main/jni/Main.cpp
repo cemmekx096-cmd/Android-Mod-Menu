@@ -12,6 +12,7 @@
 #include <mutex>
 #include <initializer_list>
 #include <set>
+#include <map>
 #include <unordered_set>
 #include <string>
 #include <sys/stat.h>
@@ -98,6 +99,8 @@ static int g_nc = 0, g_ring = 0;
 static std::string g_outDir = OUT_DIR_FALLBACK;
 static std::string g_lastFile;
 static std::atomic<uint64_t> g_seenCache[4096];
+static std::map<std::string, uintptr_t> g_caller;  // uid -> alamat pemanggil pertama (kode game yang melakukan lookup)
+static thread_local bool tlSkip = false;      // true saat kita sendiri yang memanggil TryGet (verifikasi), supaya tidak tercatat
 
 static std::string outDir() {
     std::lock_guard<std::mutex> lk(gMtx);
@@ -233,7 +236,7 @@ static std::string readStrSafe(void *s) {  // aman, dipakai di dump
 // Dipanggil dari hook Get/TryGet yang bisa dipanggil ribuan kali per frame.
 // Dedupe berdasarkan ISI string (bukan alamat pointer, karena alamat bisa dipakai ulang oleh GC),
 // pakai cache hash tanpa lock supaya tidak bikin lag.
-static void noteUid(void *s) {
+static void noteUid(void *s, uintptr_t caller = 0) {
     if (!s) return;
     int len = *(int *) ((char *) s + 0x10);
     if (len <= 0 || len > 128) return;
@@ -248,6 +251,7 @@ static void noteUid(void *s) {
     if (u.empty()) return;
     std::lock_guard<std::mutex> lk(gMtx);
     if (seenUids.size() < 50000) seenUids.insert(u);
+    if (caller && !g_caller.count(u) && g_caller.size() < 50000) g_caller[u] = caller;
 }
 
 static void noteContainer(void *c) {
@@ -430,6 +434,8 @@ static void doDumpInventory() {
     LOGI(OBFUSCATE("inv_dump selesai, kontainer=%d baris=%d"), n, g_rows.load());
 }
 
+static void doVerifyUids();
+
 static void doDumpDb() {
     FILE *f = openOut("db_dump.txt");
     if (!f) return;
@@ -463,6 +469,231 @@ static void doDumpDb() {
     fclose(f);
     g_dumps++;
     LOGI(OBFUSCATE("db_dump selesai, baris=%d uid=%zu"), g_rows.load(), uids.size());
+    doVerifyUids();
+}
+
+// ---------- Tambah item (Spinner + Input + Button) ----------
+struct AddEntry { const char *uid; const char *label; };
+static const AddEntry kItems[] = {
+    {"Log", "Kayu (Log)"},
+    {"Thatch", "Jerami dedaunan (Thatch)"},
+    {"Trash", "Sampah (Trash)"},
+    {"Clay", "Tanah liat (Clay)"},
+    {"ScrapMetal", "Rongsokan besi (ScrapMetal)"},
+    {"MetalBar", "Batang logam (MetalBar)"},
+    {"Nails", "Paku (Nails)"},
+    {"PlankTreated", "Papan olahan (PlankTreated)"},
+    {"Cloth", "Kain (Cloth)"},
+    {"Coal", "Arang (Coal)"},
+    {"MetalSheets", "Lembaran logam (MetalSheets)"},
+    {"ThickFabric", "Kain tebal (ThickFabric)"},
+    {"SteelRope", "Tali baja (SteelRope)"},
+    {"Lens", "Lensa (Lens)"},
+    {"Glass", "Kaca (Glass)"},
+    {"Rivets", "Paku keling (Rivets)"},
+    {"Wires", "Kabel (Wires)"},
+    {"AluminumSheet", "Lembaran aluminium (AluminumSheet)"},
+    {"AluminumBar", "Batang aluminium (AluminumBar)"},
+    {"AluminumProfile", "Profil aluminium (AluminumProfile)"},
+    {"EnginePart", "Suku cadang mesin (EnginePart)"},
+    {"Glue", "Lem (Glue)"},
+    {"Rubber", "Karet (Rubber)"},
+    {"RubberSheets", "Lembaran karet (RubberSheets)"},
+    {"Plywood", "Kayu lapis (Plywood)"},
+    {"CopperTube", "Pipa tembaga (CopperTube)"},
+    {"AdhesiveTape", "Isolasi (AdhesiveTape)"},
+    {"Bottle", "Botol kosong (Bottle)"},
+    {"WaterBottle2", "Botol air 2 (WaterBottle2)"},
+    {"WaterBottle3", "Botol air 3 (WaterBottle3)"},
+    {"WaterBottle4", "Botol air 4 (WaterBottle4)"},
+    {"WaterBottle5", "Botol air 5 (WaterBottle5)"},
+    {"Plank", "Papan (Plank)"},
+    {"Rope", "Tali (Rope)"},
+    {"CopperBar", "Batang tembaga (CopperBar)"},
+    {"CopperCoil", "Kumparan tembaga (CopperCoil)"},
+    {"CopperSheets", "Lembaran tembaga (CopperSheets)"},
+    {"CopperContacts", "Kontak tembaga (CopperContacts)"},
+    {"Contacts", "Kontak (Contacts)"},
+    {"PlumbumBar", "Batang timbal (PlumbumBar)"},
+    {"Ore", "Bijih (Ore)"},
+    {"AccumulatorBase", "Dasar aki (AccumulatorBase)"},
+    {"Acid", "Asam (Acid)"},
+    {"Spirit", "Spiritus (Spirit)"},
+    {"Powder", "Bubuk (Powder)"},
+    {"YellowPowder", "Bubuk kuning (YellowPowder)"},
+    {"BulletShell", "Selongsong peluru (BulletShell)"},
+    {"SawBlade", "Mata gergaji (SawBlade)"},
+    {"SteeringWheel", "Roda kemudi (SteeringWheel)"},
+    {"PlanePanel", "Panel pesawat (PlanePanel)"},
+    {"Helix", "Helix"},
+    {"SunSpray", "Semprotan sunscreen (SunSpray)"},
+    {"BlackPaint", "Cat hitam (BlackPaint)"},
+    {"BluePaint", "Cat biru (BluePaint)"},
+    {"GreenPaint", "Cat hijau (GreenPaint)"},
+    {"RedPaint", "Cat merah (RedPaint)"},
+    {"WhitePaint", "Cat putih (WhitePaint)"},
+    {"BlueMix", "Campuran biru (BlueMix)"},
+    {"Canned", "Makanan kaleng (Canned)"},
+    {"Banana_palm", "Pisang palem (Banana palm)"},
+    {"Pineapple_palm", "Nanas palem (Pineapple palm)"},
+    {"Coconut", "Kelapa (Coconut)"},
+    {"Potato", "Kentang (Potato)"},
+    {"Tomate", "Tomat (Tomate)"},
+    {"Goji", "Goji"},
+    {"Sugar", "Gula (Sugar)"},
+    {"YellowJuise", "Jus kuning (YellowJuise)"},
+    {"Fish1", "Ikan 1 (Fish1)"},
+    {"Fish2", "Ikan 2 (Fish2)"},
+    {"Fish3", "Ikan 3 (Fish3)"},
+    {"Fish4", "Ikan 4 (Fish4)"},
+    {"Fish5", "Ikan 5 (Fish5)"},
+};
+static const int kItemCount = (int) (sizeof(kItems) / sizeof(kItems[0]));
+static std::atomic<int> g_selIdx(0), g_addCount(1);
+static std::string g_addMsg = "-";
+
+static void setAddMsg(const char *m) {
+    std::lock_guard<std::mutex> lk(gMtx);
+    g_addMsg = m;
+}
+
+static std::string buildSpinnerList() {
+    std::string r = "Spinner_Pilih item_";
+    for (int i = 0; i < kItemCount; i++) {
+        if (i) r += ",";
+        r += kItems[i].label;
+    }
+    return r;
+}
+
+static void doAddItem() {
+    int idx = g_selIdx.load(), cnt = g_addCount.load();
+    if (idx < 0 || idx >= kItemCount || cnt < 1) {
+        fileLog("add: indeks/jumlah tidak valid idx=%d cnt=%d", idx, cnt);
+        setAddMsg("GAGAL: indeks/jumlah tidak valid");
+        return;
+    }
+    void *p1 = g_pbm.load(), *p2 = g_pbmFree.load(), *p3 = g_pbmAmt.load();
+    void *pbm = p1 ? p1 : (p2 ? p2 : p3);
+    if (!pbm) {
+        fileLog("add: PlayerBackpacksManager belum tertangkap");
+        setAddMsg("GAGAL: tas belum tertangkap (buka inventory dulu)");
+        return;
+    }
+    const char *uid = kItems[idx].uid;
+    auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");   // il2cpp_string_new
+    auto getLarge = (void *(*)(void *, void *)) getAbsoluteAddress(targetLibName, "0x2646A0C"); // PlayerBackpacksManager.GetLargeBackpack
+    auto put = (bool (*)(void *, void *, int, int, void *)) getAbsoluteAddress(targetLibName, "0x27C0354"); // StackContainer.Put(ThingType,int,int)
+    void *str = newStr(uid);
+    if (!str) { fileLog("add: il2cpp_string_new gagal"); setAddMsg("GAGAL: string"); return; }
+    char m[160];
+    void *cont = getLarge(pbm, nullptr);
+    fileLog("add: uid=%s jumlah=%d pbm=%p large=%p", uid, cnt, pbm, cont);
+    bool ok = false;
+    if (cont) ok = put(cont, str, cnt, 0, nullptr);
+    fileLog("add: Put(large) -> %d", ok ? 1 : 0);
+    if (!ok) {
+        void *bp = fieldPtr(pbm, 0x48);
+        if (bp) ok = put(bp, str, cnt, 0, nullptr);
+        fileLog("add: Put(backpack %p) -> %d", bp, ok ? 1 : 0);
+    }
+    snprintf(m, sizeof m, "%s %d x %s", ok ? "OK" : "GAGAL (tas penuh?)", cnt, uid);
+    setAddMsg(m);
+}
+
+// ---------- Verifikasi uid (dipanggil dari Dump database item) ----------
+// Untuk tiap uid (yang pernah dicari game + yang ada di menu Tambah item), kita panggil sendiri
+// ItemDatabaseExtensions.TryGet(db, uid, out item) dan periksa:
+//   OK          = item ditemukan DAN Item.Uid sama dengan uid yang kita kirim  -> uid asli, aman dipakai Add item
+//   UID_BEDA:x  = item ditemukan tapi Item.Uid = x  -> yang kita pegang ternyata alias/nama, bukan uid asli
+//   TIDAK_ADA   = database tidak mengenal uid itu (bukan item, atau salah tulis)
+// Lalu dicatat semua field Item (icon, kind, stack, dst.) dan "pemanggil" = RVA fungsi game yang pertama kali
+// mencari uid itu (cocokkan dengan dump.cs pakai rva2name.py).
+static void doVerifyUids() {
+    FILE *f = openOut("db_verify.txt");
+    if (!f) return;
+    fprintf(f, "# uid|status|item|icon|bgIcon|kind|use|mail|destruct|stack|rare|dur|cost|group|special|skin|pemanggil|menu\n");
+    void *db = g_db.load();
+    if (!db) {
+        fprintf(f, "# database belum tertangkap (buka craft/inventory di game dulu)\n");
+        fclose(f);
+        return;
+    }
+    auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");   // il2cpp_string_new
+    auto tryGet = (bool (*)(void *, void *, void *, void *)) getAbsoluteAddress(targetLibName, "0x23DE3FC");
+    uintptr_t base = getAbsoluteAddress(targetLibName, "0x0");
+    std::set<std::string> all, menu;
+    std::map<std::string, uintptr_t> callers;
+    {
+        std::lock_guard<std::mutex> lk(gMtx);
+        all = seenUids;
+        callers = g_caller;
+    }
+    for (int i = 0; i < kItemCount; i++) { menu.insert(kItems[i].uid); all.insert(kItems[i].uid); }
+    int nOk = 0, nBeda = 0, nNo = 0, nRaw = 0;
+    std::vector<std::string> menuBad, raws;
+    tlSkip = true;
+    for (const std::string &u : all) {
+        void *str = newStr(u.c_str());
+        void *item = nullptr;
+        bool ok = str ? tryGet(db, str, &item, nullptr) : false;
+        std::string status;
+        if (!ok) status = "TIDAK_ADA";
+        else if (!item) status = "ITEM_NULL";
+        else {
+            void *up = nullptr;
+            rd(item, 0x10, up);
+            std::string iu = readStrSafe(up);
+            status = (iu == u) ? "OK" : "UID_BEDA:" + iu;
+        }
+        bool good = (status == "OK");
+        if (good) nOk++; else if (status == "TIDAK_ADA") nNo++; else nBeda++;
+        bool inMenu = menu.count(u) > 0;
+        if (inMenu && !good) menuBad.push_back(u + "=" + status);
+
+        void *iconp = nullptr, *bgp = nullptr;
+        int kind = -1, use = -1, mail = -1, stack = -1, rare = -1, dur = -1, group = -1, skin = -1;
+        float cost = 0;
+        unsigned char destr = 0, special = 0;
+        if (item) {
+            rd(item, 0x28, iconp); rd(item, 0x30, bgp);
+            rd(item, 0x18, kind); rd(item, 0x1C, use); rd(item, 0x20, mail);
+            rd(item, 0x38, destr); rd(item, 0x3C, stack); rd(item, 0x40, rare); rd(item, 0x44, dur);
+            rd(item, 0x48, cost); rd(item, 0x4C, special); rd(item, 0x50, group); rd(item, 0x54, skin);
+        }
+        char cal[32] = "-";
+        auto it = callers.find(u);
+        if (it != callers.end() && it->second > base) snprintf(cal, sizeof cal, "caller=0x%lX", (unsigned long) (it->second - base));
+        fprintf(f, "%s|%s|%p|%s|%s|%d|%d|%d|%d|%d|%d|%d|%.2f|%d|%d|%d|%s|%s\n",
+                u.c_str(), status.c_str(), item, readStrSafe(iconp).c_str(), readStrSafe(bgp).c_str(),
+                kind, use, mail, (int) destr, stack, rare, dur, cost, group, (int) special, skin, cal, inMenu ? "M" : "-");
+        g_rows++;
+        if (item && (!good || nRaw < 8)) {
+            nRaw++;
+            std::string r = "# raw " + u + " item=";
+            char t[64];
+            snprintf(t, sizeof t, "%p:", item);
+            r += t;
+            for (size_t off = 0x10; off < 0x58; off += 8) {
+                unsigned long long w = 0;
+                rd(item, off, w);
+                snprintf(t, sizeof t, " +0x%zx=0x%llx", off, w);
+                r += t;
+                std::string sv = readStrSafe((void *) w);
+                if (!sv.empty()) r += "(\"" + sv + "\")";
+            }
+            raws.push_back(r);
+        }
+    }
+    tlSkip = false;
+    for (auto &r : raws) fprintf(f, "%s\n", r.c_str());
+    fprintf(f, "# ringkasan: OK=%d UID_BEDA/ITEM_NULL=%d TIDAK_ADA=%d dari %zu uid\n", nOk, nBeda, nNo, all.size());
+    fprintf(f, "# uid menu Tambah item yang TIDAK OK (%zu):", menuBad.size());
+    for (auto &b : menuBad) fprintf(f, " %s", b.c_str());
+    fprintf(f, "\n");
+    fclose(f);
+    LOGI(OBFUSCATE("db_verify selesai: OK=%d beda=%d tidak ada=%d"), nOk, nBeda, nNo);
+    fileLog("db_verify selesai: OK=%d beda=%d tidak_ada=%d menu_bermasalah=%zu", nOk, nBeda, nNo, menuBad.size());
 }
 
 static void runPending() {
@@ -471,6 +702,7 @@ static void runPending() {
     fileLog("runPending flags=%d", p);
     if (p & 1) doDumpInventory();
     if (p & 2) doDumpDb();
+    if (p & 4) doAddItem();
     fileLog("runPending selesai");
 }
 
@@ -524,14 +756,14 @@ void *(*old_Get)(void *, void *, void *) = nullptr;
 void *hk_Get(void *db, void *t, void *mi) {
     ONCE("hook Get aktif")
     if (db) g_db = db;
-    noteUid(t);
+    if (!tlSkip) noteUid(t, (uintptr_t) __builtin_return_address(0));
     return old_Get ? old_Get(db, t, mi) : nullptr;
 }
 bool (*old_TryGet)(void *, void *, void *, void *) = nullptr;
 bool hk_TryGet(void *db, void *t, void *out, void *mi) {
     ONCE("hook TryGet aktif")
     if (db) g_db = db;
-    noteUid(t);
+    if (!tlSkip) noteUid(t, (uintptr_t) __builtin_return_address(0));
     return old_TryGet ? old_TryGet(db, t, out, mi) : false;
 }
 
@@ -604,6 +836,8 @@ static int installNext(const char **name) {
 // ---------- menu ----------
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     jobjectArray ret;
+    static std::string spinnerStr;
+    if (spinnerStr.empty()) spinnerStr = buildSpinnerList();
     const char *features[] = {
             OBFUSCATE("Toggle_Craft semua gratis"),
             OBFUSCATE("Toggle_Unlock tanpa waktu"),
@@ -618,7 +852,11 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("Button_Siapkan (1 hook per klik)"),
             OBFUSCATE("Button_Dump inventory"),
             OBFUSCATE("Button_Dump database item"),
-            OBFUSCATE("Button_Status (cek tangkapan)")
+            OBFUSCATE("Button_Status (cek tangkapan)"),
+            OBFUSCATE("Category_Tambah item"),
+            spinnerStr.c_str(),
+            OBFUSCATE("InputValue_999_Jumlah item"),
+            OBFUSCATE("Button_Tambah ke inventory")
     };
     int Total_Feature = (sizeof features / sizeof features[0]);
     ret = (jobjectArray) env->NewObjectArray(Total_Feature, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
@@ -668,20 +906,39 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
             char b[640];
             int nc;
             size_t nu;
-            std::string last;
+            std::string last, am;
             {
                 std::lock_guard<std::mutex> lk(gMtx);
                 nc = g_nc;
                 nu = seenUids.size();
                 last = g_lastFile;
+                am = g_addMsg;
             }
-            snprintf(b, sizeof b, "hook=%d/%d tick=%d pbm=%d db=%d kontainer=%d uid=%zu dump=%d baris=%d\nfile: %s",
+            snprintf(b, sizeof b, "hook=%d/%d tick=%d pbm=%d db=%d kontainer=%d uid=%zu dump=%d baris=%d\nadd: %s\nfile: %s",
                      hookCount(), kHookTotal, g_tick.load() ? 1 : 0,
                      (g_pbm.load() || g_pbmFree.load() || g_pbmAmt.load()) ? 1 : 0,
                      g_db.load() ? 1 : 0, nc, nu, g_dumps.load(), g_rows.load(),
+                     am.c_str(),
                      last.empty() ? outDir().c_str() : last.c_str());
             showToast(env, obj, b);
             LOGI(OBFUSCATE("status: %s"), b);
+            break;
+        }
+        case 13:
+            g_selIdx = value;
+            fileLog("pilih item idx=%d", (int) value);
+            break;
+        case 14:
+            g_addCount = value < 1 ? 1 : value;
+            break;
+        case 15: {
+            int idx = g_selIdx.load();
+            if (idx < 0 || idx >= kItemCount) idx = 0;
+            pending |= 4;
+            char b[256];
+            snprintf(b, sizeof b, "Tambah %d x %s diminta%s", g_addCount.load(), kItems[idx].label,
+                     g_tick.load() ? "" : "\n(hook Tick belum aktif: tekan Siapkan sampai selesai)");
+            showToast(env, obj, b);
             break;
         }
         default: break;
