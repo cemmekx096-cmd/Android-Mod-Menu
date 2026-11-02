@@ -621,7 +621,7 @@ static void doVerifyUids() {
     }
     auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");   // il2cpp_string_new
     auto tryGet = (bool (*)(void *, void *, void *, void *)) getAbsoluteAddress(targetLibName, "0x23DE3FC");
-    uintptr_t base = getAbsoluteAddress(targetLibName, "0x0");
+    uintptr_t base = (uintptr_t) getAbsoluteAddress(targetLibName, "0x0");
     std::set<std::string> all, menu;
     std::map<std::string, uintptr_t> callers;
     {
