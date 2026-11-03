@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <cerrno>
 #include <cstdarg>
-#include <cstdlib>
 #include <ctime>
 #include <pthread.h>
 #include <thread>
@@ -38,6 +37,36 @@
 #define OUT_DIR_FALLBACK "/data/data/ocean.nomad.survival.simulator/files"
 #define USE_EXTERNAL_DIR 0
 #define ONCE(msg) { static bool _o = false; if (!_o) { _o = true; LOGI(OBFUSCATE(msg)); fileLog("%s", msg); } }
+
+// ---------- toggle cheat (ECheatKey) ----------
+std::atomic<unsigned int> cheatMask(0);
+static bool hookedSet = false;
+
+bool (*old_IsSet)(void *self, int key, void *mi) = nullptr;
+bool hk_IsSet(void *self, int key, void *mi) {
+    if (key >= 0 && key < 32 && (cheatMask.load() & (1u << key))) return true;
+    return old_IsSet ? old_IsSet(self, key, mi) : false;
+}
+
+static void setKeys(std::initializer_list<int> keys, bool on) {
+    if (on && !hookedSet) {
+        if (!isLibraryLoaded(targetLibName)) {
+            LOGI(OBFUSCATE("libil2cpp belum termuat, toggle diabaikan"));
+            return;
+        }
+        HOOK(targetLibName, "0x265C5C4", hk_IsSet, old_IsSet);
+        // hanya dianggap terpasang kalau Dobby benar-benar mengisi pointer aslinya
+        hookedSet = (old_IsSet != nullptr);
+        if (!hookedSet) {
+            LOGI(OBFUSCATE("hook IsSet gagal (cek offset 0x265C5C4)"));
+            return;
+        }
+    }
+    for (int k : keys) {
+        if (on) cheatMask |= (1u << k);
+        else cheatMask &= ~(1u << k);
+    }
+}
 
 // ---------- toast ----------
 static void showToast(JNIEnv *env, jobject ctx, const char *text) {
@@ -72,45 +101,6 @@ static std::string g_lastFile;
 static std::atomic<uint64_t> g_seenCache[4096];
 static std::map<std::string, uintptr_t> g_caller;  // uid -> alamat pemanggil pertama (kode game yang melakukan lookup)
 static thread_local bool tlSkip = false;      // true saat kita sendiri yang memanggil TryGet (verifikasi), supaya tidak tercatat
-
-// ---------- input runtime dari menu ----------
-static std::mutex gAddMtx;
-static std::string g_manualUid;               // diisi lewat InputText_ di menu
-static int g_manualAmount = 1;                // diisi lewat InputValue_ di menu
-static std::string g_addMsg = "-";
-
-// ---------- input untuk fitur ubah jumlah ----------
-static std::mutex gEditMtx;
-static int g_editIndex = 0;                   // index global 1..N dari inv_items.txt
-static int g_editAmount = 1;                  // jumlah baru
-
-static std::string getManualUid() {
-    std::lock_guard<std::mutex> lk(gAddMtx);
-    return g_manualUid;
-}
-static int getManualAmount() {
-    std::lock_guard<std::mutex> lk(gAddMtx);
-    return g_manualAmount;
-}
-static void setManualUid(const char *s) {
-    std::lock_guard<std::mutex> lk(gAddMtx);
-    g_manualUid = s ? s : "";
-}
-static void setManualAmount(int n) {
-    std::lock_guard<std::mutex> lk(gAddMtx);
-    if (n < 1) n = 1;
-    if (n > 999999) n = 999999;
-    g_manualAmount = n;
-}
-static void setAddMsg(const char *m) {
-    std::lock_guard<std::mutex> lk(gAddMtx);
-    g_addMsg = m ? m : "-";
-}
-
-static int  getEditIndex()  { std::lock_guard<std::mutex> lk(gEditMtx); return g_editIndex; }
-static int  getEditAmount() { std::lock_guard<std::mutex> lk(gEditMtx); return g_editAmount; }
-static void setEditIndex(int n)  { std::lock_guard<std::mutex> lk(gEditMtx); g_editIndex = n < 0 ? 0 : n; }
-static void setEditAmount(int n) { std::lock_guard<std::mutex> lk(gEditMtx); if (n < 0) n = 0; if (n > 999999) n = 999999; g_editAmount = n; }
 
 static std::string outDir() {
     std::lock_guard<std::mutex> lk(gMtx);
@@ -444,218 +434,6 @@ static void doDumpInventory() {
     LOGI(OBFUSCATE("inv_dump selesai, kontainer=%d baris=%d"), n, g_rows.load());
 }
 
-// ======================= SNAPSHOT TAS (dipakai fitur ubah jumlah) =======================
-
-struct BagSlot {
-    void *cell;        // Cell*
-    void *item;        // Item*
-    std::string uid;
-    std::string icon;
-    int kind;
-    int count;         // nilai saat snapshot
-};
-
-// Ambil semua Cell dari satu storage. Return jumlah slot.
-static int snapshotStorage(void *storage, std::vector<BagSlot> &out) {
-    if (!storage) return 0;
-    auto getMethod = (void *(*)(void *, const char *, int)) getAbsoluteAddress(targetLibName, "0x22227e8");
-    void *klass = nullptr;
-    if (!rd(storage, 0, klass) || !klass) return 0;
-    void *mi = getMethod(klass, "get_Cells", 0);
-    if (!mi) return 0;
-    void *fnp = nullptr;
-    if (!rd(mi, 0, fnp) || !fnp) return 0;
-    auto fn = (void *(*)(void *, void *)) fnp;
-    char *arr = (char *) fn(storage, mi);
-    if (!arr) return 0;
-    long n = 0;
-    if (!rd(arr, 0x18, n) || n < 0 || n > 10000) return 0;
-
-    for (long i = 0; i < n; i++) {
-        char *cell = nullptr, *item = nullptr;
-        if (!rd(arr, 0x20 + i * 8, cell) || !cell) continue;
-        if (!rd(cell, 0x10, item) || !item) continue;
-        BagSlot s;
-        s.cell = cell;
-        s.item = item;
-        void *up = nullptr, *iconp = nullptr;
-        rd(item, 0x10, up); rd(item, 0x28, iconp); rd(item, 0x18, s.kind);
-        rd(cell, 0x20, s.count);
-        s.uid  = readStrSafe(up);
-        s.icon = readStrSafe(iconp);
-        out.push_back(s);
-    }
-    return (int)out.size();
-}
-
-// Kumpulkan semua storage yang valid: backpack, belt, equipment, tab0-2, dan kontainer tertangkap.
-static std::vector<std::pair<std::string, void *>> collectStorages() {
-    std::vector<std::pair<std::string, void *>> result;
-    std::set<void *> seen;
-
-    void *pbm = g_pbm.load();
-    if (!pbm) pbm = g_pbmFree.load();
-    if (!pbm) pbm = g_pbmAmt.load();
-
-    if (pbm) {
-        const char *nm[3] = {"backpack", "belt", "equipment"};
-        const size_t off[3] = {0x48, 0x50, 0x58};
-        for (int i = 0; i < 3; i++) {
-            void *wrapper = fieldPtr(pbm, off[i]);
-            void *st = containerStorage(wrapper);
-            if (st && seen.insert(st).second) result.push_back({nm[i], st});
-        }
-        auto getTab = (void *(*)(void *, int, void *)) getAbsoluteAddress(targetLibName, "0x2648AD0");
-        for (int i = 0; i < 3; i++) {
-            char lb[16];
-            snprintf(lb, sizeof lb, "tab%d", i);
-            void *st = getTab(pbm, i, nullptr);
-            if (st && seen.insert(st).second) result.push_back({lb, st});
-        }
-    }
-
-    void *snap[64];
-    int n = 0;
-    {
-        std::lock_guard<std::mutex> lk(gMtx);
-        n = g_nc;
-        memcpy(snap, g_conts, sizeof(void *) * n);
-    }
-    for (int i = 0; i < n; i++) {
-        void *st = containerStorage(snap[i]);
-        if (st && seen.insert(st).second) {
-            char lb[16];
-            snprintf(lb, sizeof lb, "cont%d", i);
-            result.push_back({lb, st});
-        }
-    }
-    return result;
-}
-
-// Tulis daftar item di tas ke inv_items.txt (format: nomor|label|index_dalam_storage|uid|icon|kind|count)
-static void doDumpBagItems() {
-    FILE *f = openOut("inv_items.txt");
-    if (!f) return;
-    g_rows = 0;
-    fprintf(f, "# Format: nomor|label|index_dalam_storage|uid|icon|kind|count\n");
-    fprintf(f, "# Pakai kolom 'nomor' untuk mengisi field 'Index item' di menu.\n");
-
-    auto storages = collectStorages();
-    if (storages.empty()) {
-        fprintf(f, "# tas belum tertangkap. Tekan Siapkan + buka inventory di game dulu.\n");
-        fclose(f);
-        fileLog("inv_items: tas belum tertangkap");
-        return;
-    }
-
-    int globalIdx = 0;
-    for (auto &kv : storages) {
-        std::vector<BagSlot> slots;
-        int n = snapshotStorage(kv.second, slots);
-        fprintf(f, "# === %s (%d slot) ===\n", kv.first.c_str(), n);
-        for (int i = 0; i < (int)slots.size(); i++) {
-            globalIdx++;
-            fprintf(f, "%d|%s|%d|%s|%s|%d|%d\n",
-                    globalIdx, kv.first.c_str(), i,
-                    slots[i].uid.c_str(), slots[i].icon.c_str(),
-                    slots[i].kind, slots[i].count);
-            g_rows++;
-        }
-    }
-    fprintf(f, "# total item terdaftar: %d\n", globalIdx);
-    fclose(f);
-    fileLog("inv_items selesai, %d item", globalIdx);
-    LOGI(OBFUSCATE("inv_items selesai, %d item"), globalIdx);
-}
-
-// ======================= HITUNG UID DI STORAGE (verifikasi put) =======================
-
-// Kembalikan total count item ber-uid `uid` di dalam storage (via get_Cells).
-// -1 kalau storage tidak valid / get_Cells tidak bisa dipanggil.
-static int countUidInStorage(void *storage, const std::string &uid) {
-    if (!storage || uid.empty()) return -1;
-    auto getMethod = (void *(*)(void *, const char *, int)) getAbsoluteAddress(targetLibName, "0x22227e8");
-    void *klass = nullptr;
-    if (!rd(storage, 0, klass) || !klass) return -1;
-    void *mi = getMethod(klass, "get_Cells", 0);
-    if (!mi) return -1;
-    void *fnp = nullptr;
-    if (!rd(mi, 0, fnp) || !fnp) return -1;
-    auto fn = (void *(*)(void *, void *)) fnp;
-    char *arr = (char *) fn(storage, mi);
-    if (!arr) return -1;
-    long n = 0;
-    if (!rd(arr, 0x18, n) || n < 0 || n > 10000) return -1;
-
-    int total = 0;
-    for (long i = 0; i < n; i++) {
-        char *cell = nullptr, *item = nullptr;
-        if (!rd(arr, 0x20 + i * 8, cell) || !cell) continue;
-        if (!rd(cell, 0x10, item) || !item) continue;
-        void *up = nullptr;
-        rd(item, 0x10, up);
-        std::string iu = readStrSafe(up);
-        if (iu != uid) continue;
-        int c = 0;
-        rd(cell, 0x20, c);
-        total += (c > 0 ? c : 1);
-    }
-    return total;
-}
-
-// ======================= PROBE UID (verifikasi sebelum add) =======================
-
-enum class UidStatus {
-    EMPTY,      // uid string kosong
-    NO_DB,      // database belum tertangkap hook
-    NOT_FOUND,  // TryGet return false -> uid tidak ada di database
-    ITEM_NULL,  // TryGet true tapi out item null (bug internal)
-    ALIAS,      // item ditemukan, tapi Item.Uid != uid input
-    OK,         // item ditemukan & Item.Uid == uid input
-    STR_FAIL    // il2cpp_string_new gagal
-};
-
-struct UidProbe {
-    UidStatus status = UidStatus::EMPTY;
-    std::string resolvedUid;    // Item.Uid asli (kalau ALIAS, ini yang benar)
-    std::string icon;           // nama icon (untuk pesan)
-    void *itemPtr = nullptr;    // pointer Item (informatif)
-};
-
-static UidProbe probeUid(const std::string &uid) {
-    UidProbe p;
-    if (uid.empty()) { p.status = UidStatus::EMPTY; return p; }
-    void *db = g_db.load();
-    if (!db) { p.status = UidStatus::NO_DB; return p; }
-
-    auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");
-    auto tryGet = (bool (*)(void *, void *, void *, void *)) getAbsoluteAddress(targetLibName, "0x23DE3FC");
-    if (!newStr || !tryGet) { p.status = UidStatus::NO_DB; return p; }
-
-    void *str = newStr(uid.c_str());
-    if (!str) { p.status = UidStatus::STR_FAIL; return p; }
-
-    void *item = nullptr;
-    bool prevSkip = tlSkip;
-    tlSkip = true;
-    bool found = tryGet(db, str, &item, nullptr);
-    tlSkip = prevSkip;
-
-    if (!found) { p.status = UidStatus::NOT_FOUND; return p; }
-    if (!item)  { p.status = UidStatus::ITEM_NULL; return p; }
-
-    void *up = nullptr, *iconp = nullptr;
-    rd(item, 0x10, up);
-    rd(item, 0x28, iconp);
-    p.itemPtr    = item;
-    p.resolvedUid = readStrSafe(up);
-    p.icon        = readStrSafe(iconp);
-    p.status = (p.resolvedUid == uid) ? UidStatus::OK : UidStatus::ALIAS;
-    return p;
-}
-
-// ======================= DUMP DATABASE + VERIFY =======================
-
 static void doVerifyUids();
 
 static void doDumpDb() {
@@ -694,6 +472,222 @@ static void doDumpDb() {
     doVerifyUids();
 }
 
+// ---------- Tambah item (Spinner + Input + Button) ----------
+struct AddEntry { const char *uid; const char *label; };
+static const AddEntry kItems[] = {
+    {"Log", "Kayu (Log)"},
+    {"Thatch", "Jerami dedaunan (Thatch)"},
+    {"Trash", "Sampah (Trash)"},
+    {"Clay", "Tanah liat (Clay)"},
+    {"ScrapMetal", "Rongsokan besi (ScrapMetal)"},
+    {"MetalBar", "Batang logam (MetalBar)"},
+    {"Nails", "Paku (Nails)"},
+    {"PlankTreated", "Papan olahan (PlankTreated)"},
+    {"Cloth", "Kain (Cloth)"},
+    {"Coal", "Arang (Coal)"},
+    {"MetalSheets", "Lembaran logam (MetalSheets)"},
+    {"ThickFabric", "Kain tebal (ThickFabric)"},
+    {"SteelRope", "Tali baja (SteelRope)"},
+    {"Lens", "Lensa (Lens)"},
+    {"Glass", "Kaca (Glass)"},
+    {"Rivets", "Paku keling (Rivets)"},
+    {"Wires", "Kabel (Wires)"},
+    {"AluminumSheet", "Lembaran aluminium (AluminumSheet)"},
+    {"AluminumBar", "Batang aluminium (AluminumBar)"},
+    {"AluminumProfile", "Profil aluminium (AluminumProfile)"},
+    {"EnginePart", "Suku cadang mesin (EnginePart)"},
+    {"Glue", "Lem (Glue)"},
+    {"Rubber", "Karet (Rubber)"},
+    {"RubberSheets", "Lembaran karet (RubberSheets)"},
+    {"Plywood", "Kayu lapis (Plywood)"},
+    {"CopperTube", "Pipa tembaga (CopperTube)"},
+    {"AdhesiveTape", "Isolasi (AdhesiveTape)"},
+    {"Bottle", "Botol kosong (Bottle)"},
+    {"WaterBottle2", "Botol air 2 (WaterBottle2)"},
+    {"WaterBottle3", "Botol air 3 (WaterBottle3)"},
+    {"WaterBottle4", "Botol air 4 (WaterBottle4)"},
+    {"WaterBottle5", "Botol air 5 (WaterBottle5)"},
+    {"Plank", "Papan (Plank)"},
+    {"Rope", "Tali (Rope)"},
+    {"CopperBar", "Batang tembaga (CopperBar)"},
+    {"CopperCoil", "Kumparan tembaga (CopperCoil)"},
+    {"CopperSheets", "Lembaran tembaga (CopperSheets)"},
+    {"CopperContacts", "Kontak tembaga (CopperContacts)"},
+    {"Contacts", "Kontak (Contacts)"},
+    {"PlumbumBar", "Batang timbal (PlumbumBar)"},
+    {"Ore", "Bijih (Ore)"},
+    {"AccumulatorBase", "Dasar aki (AccumulatorBase)"},
+    {"Acid", "Asam (Acid)"},
+    {"Spirit", "Spiritus (Spirit)"},
+    {"Powder", "Bubuk (Powder)"},
+    {"YellowPowder", "Bubuk kuning (YellowPowder)"},
+    {"BulletShell", "Selongsong peluru (BulletShell)"},
+    {"SawBlade", "Mata gergaji (SawBlade)"},
+    {"SteeringWheel", "Roda kemudi (SteeringWheel)"},
+    {"PlanePanel", "Panel pesawat (PlanePanel)"},
+    {"Helix", "Helix"},
+    {"SunSpray", "Semprotan sunscreen (SunSpray)"},
+    {"BlackPaint", "Cat hitam (BlackPaint)"},
+    {"BluePaint", "Cat biru (BluePaint)"},
+    {"GreenPaint", "Cat hijau (GreenPaint)"},
+    {"RedPaint", "Cat merah (RedPaint)"},
+    {"WhitePaint", "Cat putih (WhitePaint)"},
+    {"BlueMix", "Campuran biru (BlueMix)"},
+    {"Canned", "Makanan kaleng (Canned)"},
+    {"Banana_palm", "Pisang palem (Banana palm)"},
+    {"Pineapple_palm", "Nanas palem (Pineapple palm)"},
+    {"Coconut", "Kelapa (Coconut)"},
+    {"Potato", "Kentang (Potato)"},
+    {"Tomate", "Tomat (Tomate)"},
+    {"Goji", "Goji"},
+    {"Sugar", "Gula (Sugar)"},
+    {"YellowJuise", "Jus kuning (YellowJuise)"},
+    {"Fish1", "Ikan 1 (Fish1)"},
+    {"Fish2", "Ikan 2 (Fish2)"},
+    {"Fish3", "Ikan 3 (Fish3)"},
+    {"Fish4", "Ikan 4 (Fish4)"},
+    {"Fish5", "Ikan 5 (Fish5)"},
+};
+static const int kItemCount = (int) (sizeof(kItems) / sizeof(kItems[0]));
+static std::atomic<int> g_selIdx(0), g_addCount(1);
+static std::string g_addMsg = "-";
+
+static void setAddMsg(const char *m) {
+    std::lock_guard<std::mutex> lk(gMtx);
+    g_addMsg = m;
+}
+
+static std::string buildSpinnerList() {
+    std::string r = "Spinner_Pilih item_";
+    for (int i = 0; i < kItemCount; i++) {
+        if (i) r += ",";
+        r += kItems[i].label;
+    }
+    return r;
+}
+
+static std::string g_manualUid;   // uid yang diketik user (dijaga gMtx)
+
+// Tambah item + DEBUG bertahap supaya jelas penyebab gagalnya:
+//   A. uid        : TryGet(db, uid) harus mengembalikan Item yang Item.Uid-nya sama  -> kalau gagal = masalah UID
+//   B. wadah/tas  : PlayerBackpacksManager, GetLargeBackpack, backpack ada? ruang kosong? muat?   -> masalah TAS/UKURAN
+//   C. Put        : jumlah item di wadah SEBELUM dan SESUDAH Put (Count)                          -> masalah PEMANGGILAN/PENEMPATAN
+// Hasil lengkap ditulis ke add_debug.txt, ringkasan (verdict) ke Status dan mod_log.txt.
+static void addByUid(const std::string &uid, int cnt) {
+    std::string rep, verdict, lastReason = "tidak ada wadah yang bisa dicoba";
+    auto L = [&](const char *fmt, ...) {
+        char b[600];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(b, sizeof b, fmt, ap);
+        va_end(ap);
+        rep += b;
+        rep += "\n";
+    };
+    L("# uid='%s' jumlah=%d", uid.c_str(), cnt);
+    do {
+        if (uid.empty() || uid.size() > 64 || cnt < 1) { verdict = "INPUT: uid kosong/terlalu panjang atau jumlah < 1"; break; }
+        auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");     // il2cpp_string_new
+        auto tryGet = (bool (*)(void *, void *, void *, void *)) getAbsoluteAddress(targetLibName, "0x23DE3FC");
+        auto getLarge = (void *(*)(void *, void *)) getAbsoluteAddress(targetLibName, "0x2646A0C");  // PlayerBackpacksManager.GetLargeBackpack
+        auto put = (bool (*)(void *, void *, int, int, void *)) getAbsoluteAddress(targetLibName, "0x27C0354");   // StackContainer.Put(ThingType,int,int)
+        auto countF = (int (*)(void *, void *, void *)) getAbsoluteAddress(targetLibName, "0x27C1910");           // StackContainer.Count(string)
+        auto emptyF = (int (*)(void *, void *)) getAbsoluteAddress(targetLibName, "0x27C113C");                   // StackContainer.CountEmpty()
+        auto fullF = (bool (*)(void *, void *)) getAbsoluteAddress(targetLibName, "0x27BA2B0");                   // AbstractContainer.Full()
+        auto enoughF = (bool (*)(void *, void *, int, void *)) getAbsoluteAddress(targetLibName, "0x27C0A88");    // StackContainer.IsEnoughSpace
+        auto fitF = (int (*)(void *, void *, int, void *)) getAbsoluteAddress(targetLibName, "0x27C0DA0");        // StackContainer.GetFitAmount
+        void *str = newStr(uid.c_str());
+        if (!str) { verdict = "INTERNAL: il2cpp_string_new gagal"; break; }
+
+        // --- A. verifikasi uid ---
+        void *db = g_db.load();
+        if (!db) {
+            L("A. uid: database belum tertangkap -> verifikasi uid dilewati");
+        } else {
+            void *item = nullptr;
+            tlSkip = true;
+            bool ok = tryGet(db, str, &item, nullptr);
+            tlSkip = false;
+            std::string iu;
+            if (ok && item) { void *up = nullptr; rd(item, 0x10, up); iu = readStrSafe(up); }
+            bool uidOk = ok && item && iu == uid;
+            int stack = -1;
+            if (item) rd(item, 0x3C, stack);
+            L("A. uid: TryGet=%d item=%p Item.Uid='%s' stackMaks=%d -> %s", ok ? 1 : 0, item, iu.c_str(), stack, uidOk ? "OK" : "TIDAK DIKENAL");
+            if (!uidOk) { verdict = "UID: tidak dikenal database (bukan masalah tas)"; break; }
+        }
+
+        // --- B. wadah ---
+        void *pbm = g_pbm.load();
+        if (!pbm) pbm = g_pbmFree.load();
+        if (!pbm) pbm = g_pbmAmt.load();
+        if (!pbm) { verdict = "TAS: PlayerBackpacksManager belum tertangkap (buka inventory, tekan Siapkan)"; break; }
+        void *large = getLarge(pbm, nullptr);
+        void *bp = fieldPtr(pbm, 0x48);
+        L("B. pbm=%p large=%p backpack=%p", pbm, large, bp);
+        struct Cand { const char *name; void *c; };
+        Cand cands[2] = {{"large", large}, {"backpack", bp}};
+        bool finished = false;
+        for (auto &cd : cands) {
+            if (!cd.c) { L("   %s: null -> dilewati", cd.name); continue; }
+            if (cd.c == large && std::string(cd.name) == "backpack") { L("   backpack sama dengan large -> dilewati"); continue; }
+            int before = countF(cd.c, str, nullptr);
+            int empty = emptyF(cd.c, nullptr);
+            bool full = fullF(cd.c, nullptr);
+            bool enough = enoughF(cd.c, str, cnt, nullptr);
+            int fit = fitF(cd.c, str, cnt, nullptr);
+            L("B. %s=%p jumlahSebelum=%d slotKosong=%d penuh=%d muat=%d bisaMasuk=%d", cd.name, cd.c, before, empty, full ? 1 : 0, enough ? 1 : 0, fit);
+            // --- C. Put ---
+            bool r = put(cd.c, str, cnt, 0, nullptr);
+            int after = countF(cd.c, str, nullptr);
+            int delta = after - before;
+            L("C. Put(%s)=%d jumlahSesudah=%d (bertambah %d dari diminta %d)", cd.name, r ? 1 : 0, after, delta, cnt);
+            char vb[200];
+            if (delta >= cnt) {
+                snprintf(vb, sizeof vb, "BERHASIL: %d x %s masuk ke %s", delta, uid.c_str(), cd.name);
+                verdict = vb; finished = true; break;
+            }
+            if (delta > 0) {
+                snprintf(vb, sizeof vb, "SEBAGIAN: %d dari %d x %s masuk ke %s (sisanya tidak muat)", delta, cnt, uid.c_str(), cd.name);
+                verdict = vb; finished = true; break;
+            }
+            if (!enough && fit == 0) lastReason = "TAS/UKURAN: tidak ada ruang untuk item ini (bukan masalah uid)";
+            else if (!r) lastReason = "PEMANGGILAN: Put menolak padahal ruang cukup (cek parameter/wadah)";
+            else lastReason = "PENEMPATAN: Put=true tapi jumlah tidak berubah (wadah salah atau hitungan beda)";
+            L("   -> %s", lastReason.c_str());
+        }
+        if (!finished) verdict = lastReason;
+    } while (false);
+    L("# HASIL: %s", verdict.c_str());
+    FILE *f = openOut("add_debug.txt");
+    if (f) { fputs(rep.c_str(), f); fclose(f); }
+    fileLog("add: %s", verdict.c_str());
+    setAddMsg(verdict.c_str());
+}
+
+static void doAddItem() {
+    int idx = g_selIdx.load();
+    if (idx < 0 || idx >= kItemCount) idx = 0;
+    addByUid(kItems[idx].uid, g_addCount.load());
+}
+
+static void doAddManual() {
+    std::string u;
+    {
+        std::lock_guard<std::mutex> lk(gMtx);
+        u = g_manualUid;
+    }
+    addByUid(u, g_addCount.load());
+}
+
+// ---------- Verifikasi uid (dipanggil dari Dump database item) ----------
+// Untuk tiap uid (yang pernah dicari game + yang ada di menu Tambah item), kita panggil sendiri
+// ItemDatabaseExtensions.TryGet(db, uid, out item) dan periksa:
+//   OK          = item ditemukan DAN Item.Uid sama dengan uid yang kita kirim  -> uid asli, aman dipakai Add item
+//   UID_BEDA:x  = item ditemukan tapi Item.Uid = x  -> yang kita pegang ternyata alias/nama, bukan uid asli
+//   TIDAK_ADA   = database tidak mengenal uid itu (bukan item, atau salah tulis)
+// Lalu dicatat semua field Item (icon, kind, stack, dst.) dan "pemanggil" = RVA fungsi game yang pertama kali
+// mencari uid itu (cocokkan dengan dump.cs pakai rva2name.py).
 static void doVerifyUids() {
     FILE *f = openOut("db_verify.txt");
     if (!f) return;
@@ -704,9 +698,10 @@ static void doVerifyUids() {
         fclose(f);
         return;
     }
-    auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");
+    auto newStr = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");   // il2cpp_string_new
     auto tryGet = (bool (*)(void *, void *, void *, void *)) getAbsoluteAddress(targetLibName, "0x23DE3FC");
-    uintptr_t base = (uintptr_t) getAbsoluteAddress(targetLibName, "0x0");
+    // base = alamat fungsi yang RVA-nya diketahui (il2cpp_domain_get = 0x2222c84) dikurangi RVA-nya
+    uintptr_t base = (uintptr_t) getAbsoluteAddress(targetLibName, "0x2222c84") - 0x2222c84;
     std::set<std::string> all, menu;
     std::map<std::string, uintptr_t> callers;
     {
@@ -714,11 +709,7 @@ static void doVerifyUids() {
         all = seenUids;
         callers = g_caller;
     }
-    std::string mu = getManualUid();
-    if (!mu.empty()) {
-        menu.insert(mu);
-        all.insert(mu);
-    }
+    for (int i = 0; i < kItemCount; i++) { menu.insert(kItems[i].uid); all.insert(kItems[i].uid); }
     int nOk = 0, nBeda = 0, nNo = 0, nRaw = 0;
     std::vector<std::string> menuBad, raws;
     tlSkip = true;
@@ -785,220 +776,22 @@ static void doVerifyUids() {
     fileLog("db_verify selesai: OK=%d beda=%d tidak_ada=%d menu_bermasalah=%zu", nOk, nBeda, nNo, menuBad.size());
 }
 
-// ======================= ADD ITEM (UID dari menu) =======================
-
-static void doAddItem() {
-    std::string uid = getManualUid();
-    int cnt = getManualAmount();
-
-    if (uid.empty()) {
-        setAddMsg("GAGAL: UID kosong");
-        fileLog("add: uid kosong");
-        return;
-    }
-
-    // --- Tahap 1: verifikasi UID ---
-    UidProbe p = probeUid(uid);
-    switch (p.status) {
-        case UidStatus::NO_DB:
-            setAddMsg("GAGAL: database belum tertangkap. Buka inventory/craft dulu.");
-            fileLog("add: db belum tertangkap");
-            return;
-        case UidStatus::NOT_FOUND:
-            setAddMsg(("GAGAL: UID tidak ada di database: " + uid).c_str());
-            fileLog("add: uid TIDAK_ADA = %s", uid.c_str());
-            return;
-        case UidStatus::ITEM_NULL:
-            setAddMsg("GAGAL: TryGet true tapi item null (bug internal)");
-            fileLog("add: uid=%s TryGet true item null", uid.c_str());
-            return;
-        case UidStatus::ALIAS: {
-            fileLog("add: uid '%s' adalah alias, resolved -> '%s'", uid.c_str(), p.resolvedUid.c_str());
-            setAddMsg(("UID alias, memakai yang asli: " + p.resolvedUid).c_str());
-            uid = p.resolvedUid;
-            break;
-        }
-        case UidStatus::STR_FAIL:
-            setAddMsg("GAGAL: il2cpp_string_new gagal");
-            return;
-        case UidStatus::OK:
-            break;
-        default:
-            return;
-    }
-
-    // --- Tahap 2: tas tertangkap? ---
-    void *pbm = g_pbm.load();
-    if (!pbm) pbm = g_pbmFree.load();
-    if (!pbm) pbm = g_pbmAmt.load();
-    if (!pbm) {
-        setAddMsg("GAGAL: tas belum tertangkap. Buka inventory dulu.");
-        fileLog("add: pbm belum tertangkap");
-        return;
-    }
-
-    auto newStr  = (void *(*)(const char *)) getAbsoluteAddress(targetLibName, "0x22230c4");
-    auto getLarge= (void *(*)(void *, void *)) getAbsoluteAddress(targetLibName, "0x2646A0C");
-    auto put     = (bool (*)(void *, void *, int, int, void *)) getAbsoluteAddress(targetLibName, "0x27C0354");
-    if (!newStr || !getLarge || !put) {
-        setAddMsg("GAGAL: fungsi il2cpp tidak tersedia");
-        return;
-    }
-
-    void *str = newStr(uid.c_str());
-    if (!str) { setAddMsg("GAGAL: string uid gagal"); return; }
-
-    void *cont = getLarge(pbm, nullptr);
-    void *bpFallback = fieldPtr(pbm, 0x48);
-
-    // --- Tahap 3: catat kondisi tas SEBELUM put ---
-    int beforeLarge = countUidInStorage(cont, uid);
-    int beforeBp    = countUidInStorage(bpFallback, uid);
-    fileLog("add: SEBELUM large=%d bp=%d (uid=%s, cnt=%d)", beforeLarge, beforeBp, uid.c_str(), cnt);
-
-    // --- Tahap 4: put ---
-    bool okLarge = false, okBp = false;
-    if (cont) okLarge = put(cont, str, cnt, 0, nullptr);
-    fileLog("add: Put(large) -> %d", okLarge ? 1 : 0);
-    if (!okLarge && bpFallback) {
-        okBp = put(bpFallback, str, cnt, 0, nullptr);
-        fileLog("add: Put(backpack) -> %d", okBp ? 1 : 0);
-    }
-
-    // --- Tahap 5: catat kondisi tas SESUDAH put ---
-    int afterLarge = countUidInStorage(cont, uid);
-    int afterBp    = countUidInStorage(bpFallback, uid);
-    fileLog("add: SESUDAH large=%d bp=%d", afterLarge, afterBp);
-
-    // --- Tahap 6: diagnosa hasil ---
-    bool masukLarge = (afterLarge > beforeLarge);
-    bool masukBp    = (afterBp > beforeBp);
-    bool putClaimed = (okLarge || okBp);
-
-    char msg[256];
-    if (masukLarge || masukBp) {
-        snprintf(msg, sizeof msg, "OK %d x %s (large +%d, bp +%d)",
-                 cnt, uid.c_str(),
-                 afterLarge - beforeLarge, afterBp - beforeBp);
-    } else if (putClaimed) {
-        snprintf(msg, sizeof msg,
-                 "GAGAL-UI: put()=true tapi item tidak masuk. Kemungkinan UI belum refresh atau salah container.");
-    } else {
-        snprintf(msg, sizeof msg,
-                 "GAGAL-PUT: tas menolak (penuh? uid valid tapi signature put salah?).");
-    }
-    setAddMsg(msg);
-    fileLog("add: HASIL %s", msg);
-}
-
-// ======================= UBAH JUMLAH ITEM DI TAS =======================
-
-// Ubah count Cell di index global tertentu.
-// Return: 1 sukses, 0 index tidak valid, -1 tas tidak ada, -2 tulis gagal
-static int changeCellCount(int globalIndex, int newAmount) {
-    if (globalIndex < 1) return 0;
-    auto storages = collectStorages();
-    if (storages.empty()) return -1;
-
-    int counter = 0;
-    for (auto &kv : storages) {
-        std::vector<BagSlot> slots;
-        snapshotStorage(kv.second, slots);
-        for (auto &s : slots) {
-            counter++;
-            if (counter != globalIndex) continue;
-
-            int before = 0;
-            rd(s.cell, 0x20, before);
-
-            // Tulis langsung ke Cell+0x20
-            int *target = (int *) ((char *) s.cell + 0x20);
-            *target = newAmount;
-
-            int after = 0;
-            rd(s.cell, 0x20, after);
-
-            fileLog("edit: %s uid=%s before=%d want=%d after=%d",
-                    kv.first.c_str(), s.uid.c_str(), before, newAmount, after);
-            return (after == newAmount) ? 1 : -2;
-        }
-    }
-    return 0;
-}
-
-static void doEditAmount() {
-    int idx = getEditIndex();
-    int amt = getEditAmount();
-    if (idx < 1) {
-        setAddMsg("GAGAL-EDIT: index item belum diisi (lihat inv_items.txt)");
-        fileLog("edit: index invalid");
-        return;
-    }
-    int r = changeCellCount(idx, amt);
-    switch (r) {
-        case  1: setAddMsg(("OK-EDIT: item #" + std::to_string(idx) + " -> " + std::to_string(amt)).c_str()); break;
-        case  0: setAddMsg("GAGAL-EDIT: index di luar jangkauan. Refresh daftar item dulu."); break;
-        case -1: setAddMsg("GAGAL-EDIT: tas belum tertangkap. Buka inventory dulu."); break;
-        case -2: setAddMsg("GAGAL-EDIT: tulis cell+0x20 tidak berubah. Offset count mungkin salah (lihat mod_log.txt)."); break;
-    }
-    fileLog("edit: hasil=%d idx=%d amt=%d", r, idx, amt);
-}
-
-// ======================= PENDING DISPATCH =======================
-
 static void runPending() {
-    int p = pending.load(std::memory_order_relaxed);
-    if (!p) return;
-
-    // Bit 4: add item
-    if (p & 4) {
-        pending.fetch_and(~4);
-        fileLog("runPending: proses tambah UID");
-        doAddItem();
-    }
-    // Bit 8: ubah jumlah
-    if (p & 8) {
-        pending.fetch_and(~8);
-        fileLog("runPending: proses ubah jumlah");
-        doEditAmount();
-    }
-    // Bit 16: refresh daftar item
-    if (p & 16) {
-        pending.fetch_and(~16);
-        fileLog("runPending: refresh daftar item");
-        doDumpBagItems();
-        UidProbe pr = probeUid(getManualUid());
-        if (pr.status == UidStatus::NOT_FOUND)
-            fileLog("refresh: uid menu '%s' TIDAK ada di db", getManualUid().c_str());
-    }
-
-    p = pending.load(std::memory_order_relaxed);
-    if (!(p & 3)) return;
-
-    if ((!g_pbm.load() && !g_pbmFree.load() && !g_pbmAmt.load()) || !g_db.load()) {
-        static std::atomic<bool> waitingLogged(false);
-        if (!waitingLogged.exchange(true))
-            fileLog("dump gabungan menunggu capture: pbm=%d db=%d",
-                    (g_pbm.load() || g_pbmFree.load() || g_pbmAmt.load()) ? 1 : 0,
-                    g_db.load() ? 1 : 0);
-        return;
-    }
-
-    int dumpFlags = pending.fetch_and(~3) & 3;
-    if (!dumpFlags) return;
-    fileLog("runPending dumpFlags=%d", dumpFlags);
-    if (dumpFlags & 1) doDumpInventory();
-    if (dumpFlags & 2) doDumpDb();
+    if (!pending.load(std::memory_order_relaxed)) return;
+    int p = pending.exchange(0);
+    fileLog("runPending flags=%d", p);
+    if (p & 1) doDumpInventory();
+    if (p & 2) doDumpDb();
+    if (p & 4) doAddItem();
+    if (p & 8) doAddManual();
     fileLog("runPending selesai");
 }
-
-// ======================= HOOKS =======================
 
 void (*old_Tick)(void *, void *) = nullptr;
 void hk_Tick(void *self, void *mi) {
     ONCE("hook Tick aktif")
     g_tick = true;
-    {
+    {   // detak jantung tiap 2 detik: kelihatan berapa lama game bertahan setelah hook dipasang
         static time_t lastBeat = 0;
         static int beats = 0;
         time_t now = time(nullptr);
@@ -1062,6 +855,9 @@ static int hookCount() {
            (old_FreeCells ? 1 : 0) + (old_AmountThing ? 1 : 0) + (old_Get ? 1 : 0) + (old_TryGet ? 1 : 0);
 }
 
+// Pasang hook hanya kalau belum terpasang; berhasil kalau Dobby mengisi pointer aslinya
+// Catat 6 instruksi pertama di target SEBELUM di-hook. "ret@N" = fungsi sudah selesai di instruksi ke-N
+// (kalau N < 4, fungsinya lebih pendek dari patch Dobby ~16 byte dan bisa merusak fungsi tetangganya).
 #define LOG_BYTES(H_OFF) \
     do { \
         const uint32_t *bp_ = (const uint32_t *) getAbsoluteAddress(targetLibName, H_OFF); \
@@ -1086,164 +882,178 @@ static int hookCount() {
         } \
     } while (0)
 
-static int installAll(const char **summary) {
-    if (!isLibraryLoaded(targetLibName)) {
-        *summary = "libil2cpp belum termuat";
-        return -1;
-    }
+// MODE BISECT: tiap tekan "Siapkan" memasang SATU hook berikutnya, supaya ketahuan hook mana yang
+// bikin game crash. Urutan = urutan di bawah.
+static int g_step = 0;
 
+// return: 1 = terpasang, 0 = gagal, -1 = libil2cpp belum termuat, -2 = semua sudah terpasang
+static int installNext(const char **name) {
+    if (!isLibraryLoaded(targetLibName)) return -1;
+    if (g_step >= kHookTotal) return -2;
     int failed = 0;
-    TRY_HOOK("0x2576748", hk_Tick, old_Tick);
-    TRY_HOOK("0x27C1910", hk_Count, old_Count);
-    TRY_HOOK("0x27C1D6C", hk_Enough, old_Enough);
-    TRY_HOOK("0x2647140", hk_SelBackpack, old_SelBackpack);
-    TRY_HOOK("0x2648D00", hk_FreeCells, old_FreeCells);
-    TRY_HOOK("0x2647348", hk_AmountThing, old_AmountThing);
-    TRY_HOOK("0x23DE354", hk_Get, old_Get);
-    TRY_HOOK("0x23DE3FC", hk_TryGet, old_TryGet);
-
-    const int installed = hookCount();
-    static char result[96];
-    snprintf(result, sizeof result, "hook terpasang %d/%d, gagal=%d",
-             installed, kHookTotal, failed);
-    *summary = result;
-
-    fileLog("installAll selesai: hook=%d/%d gagal=%d", installed, kHookTotal, failed);
+    int s = g_step++;
+    switch (s) {
+        case 0: *name = "Tick 0x2576748";
+            TRY_HOOK("0x2576748", hk_Tick, old_Tick); break;
+        case 1: *name = "Count 0x27C1910";
+            TRY_HOOK("0x27C1910", hk_Count, old_Count); break;
+        case 2: *name = "Enough 0x27C1D6C";
+            TRY_HOOK("0x27C1D6C", hk_Enough, old_Enough); break;
+        case 3: *name = "SelBackpack 0x2647140";
+            TRY_HOOK("0x2647140", hk_SelBackpack, old_SelBackpack); break;
+        case 4: *name = "FreeCells 0x2648D00";
+            TRY_HOOK("0x2648D00", hk_FreeCells, old_FreeCells); break;
+        case 5: *name = "AmountThing 0x2647348";
+            TRY_HOOK("0x2647348", hk_AmountThing, old_AmountThing); break;
+        case 6: *name = "Get 0x23DE354";
+            TRY_HOOK("0x23DE354", hk_Get, old_Get); break;
+        default: *name = "TryGet 0x23DE3FC";
+            TRY_HOOK("0x23DE3FC", hk_TryGet, old_TryGet); break;
+    }
+    LOGI(OBFUSCATE("hook step %d/%d %s: terpasang=%d gagal=%d"), g_step, kHookTotal, *name, hookCount(), failed);
     return failed ? 0 : 1;
 }
 
-// ======================= MENU =======================
-
+// ---------- menu ----------
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
+    jobjectArray ret;
+    static std::string spinnerStr;
+    if (spinnerStr.empty()) spinnerStr = buildSpinnerList();
     const char *features[] = {
-        OBFUSCATE("Button_Siapkan (8 hooks + dump inventory & database)"),  // 0
-        OBFUSCATE("InputText_UID item (string)"),                           // 1
-        OBFUSCATE("InputValue_Jumlah item (angka)"),                        // 2
-        OBFUSCATE("Button_Tambahkan UID ke tas"),                           // 3
-        OBFUSCATE("Button_Refresh daftar item di tas (inv_items.txt)"),     // 4
-        OBFUSCATE("InputValue_Index item (1..N, lihat inv_items.txt)"),     // 5
-        OBFUSCATE("InputValue_Jumlah baru"),                                // 6
-        OBFUSCATE("Button_Ubah jumlah item #index")                         // 7
+            OBFUSCATE("Toggle_Craft semua gratis"),
+            OBFUSCATE("Toggle_Unlock tanpa waktu"),
+            OBFUSCATE("Toggle_Tanpa damage"),
+            OBFUSCATE("Toggle_Tanpa lapar"),
+            OBFUSCATE("Toggle_Tanpa haus"),
+            OBFUSCATE("Toggle_Skill gratis"),
+            OBFUSCATE("Toggle_Gerak cepat"),
+            OBFUSCATE("Toggle_Memancing tidak gagal"),
+            OBFUSCATE("Toggle_Berenang bebas"),
+            OBFUSCATE("Category_Debug"),
+            OBFUSCATE("Button_Siapkan (1 hook per klik)"),
+            OBFUSCATE("Button_Dump inventory"),
+            OBFUSCATE("Button_Dump database item"),
+            OBFUSCATE("Button_Status (cek tangkapan)"),
+            OBFUSCATE("Category_Tambah item"),
+            spinnerStr.c_str(),
+            OBFUSCATE("InputValue_999_Jumlah item"),
+            OBFUSCATE("Button_Tambah ke inventory"),
+            OBFUSCATE("Category_Tes uid manual"),
+            OBFUSCATE("InputText_Uid (ketik persis)"),
+            OBFUSCATE("Button_Tambah uid manual")
     };
-
-    const int total = (int)(sizeof(features) / sizeof(features[0]));
-    jobjectArray ret = (jobjectArray) env->NewObjectArray(
-        total, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
-    for (int i = 0; i < total; i++)
+    int Total_Feature = (sizeof features / sizeof features[0]);
+    ret = (jobjectArray) env->NewObjectArray(Total_Feature, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
+    for (int i = 0; i < Total_Feature; i++)
         env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
-    return ret;
+    return (ret);
 }
 
-void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName,
-             jint value, jlong Lvalue, jboolean boolean, jstring text) {
-    // ---- featNum 1: input UID (text) ----
-    if (featNum == 1) {
-        if (text) {
-            const char *c = env->GetStringUTFChars(text, nullptr);
-            if (c) {
-                setManualUid(c);
-                fileLog("menu: UID diisi = '%s'", c);
-                env->ReleaseStringUTFChars(text, c);
-            }
-        }
-        return;
-    }
-
-    // ---- featNum 2: input jumlah ----
-    if (featNum == 2) {
-        int n = (int) value;
-        if (n <= 0 && text) {
-            const char *c = env->GetStringUTFChars(text, nullptr);
-            if (c) { n = atoi(c); env->ReleaseStringUTFChars(text, c); }
-        }
-        setManualAmount(n);
-        fileLog("menu: jumlah diisi = %d", getManualAmount());
-        return;
-    }
-
-    // ---- featNum 5: input index item ----
-    if (featNum == 5) {
-        setEditIndex((int) value);
-        fileLog("menu: edit index = %d", getEditIndex());
-        return;
-    }
-
-    // ---- featNum 6: input jumlah baru ----
-    if (featNum == 6) {
-        int n = (int) value;
-        if (n <= 0 && text) {
-            const char *c = env->GetStringUTFChars(text, nullptr);
-            if (c) { n = atoi(c); env->ReleaseStringUTFChars(text, c); }
-        }
-        setEditAmount(n);
-        fileLog("menu: jumlah baru = %d", getEditAmount());
-        return;
-    }
-
+void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName, jint value, jlong Lvalue, jboolean boolean, jstring text) {
     switch (featNum) {
-        case 0: {   // tombol Siapkan
+        case 0: setKeys({0}, boolean); break;
+        case 1: setKeys({5, 6}, boolean); break;
+        case 2: setKeys({7}, boolean); break;
+        case 3: setKeys({8}, boolean); break;
+        case 4: setKeys({9}, boolean); break;
+        case 5: setKeys({10}, boolean); break;
+        case 6: setKeys({12}, boolean); break;
+        case 7: setKeys({3}, boolean); break;
+        case 8: setKeys({11}, boolean); break;
+        case 9: {
+            const char *nm = "";
+            fileLog("tombol Siapkan ditekan (step berikutnya=%d)", g_step + 1);
+            int r = installNext(&nm);
+            fileLog("installNext hasil=%d (%s)", r, nm);
+            char b[160];
+            if (r == -1) snprintf(b, sizeof b, "libil2cpp belum termuat, coba lagi sebentar");
+            else if (r == -2) snprintf(b, sizeof b, "Semua %d hook sudah terpasang", kHookTotal);
+            else if (r == 1) snprintf(b, sizeof b, "Hook %d/%d OK: %s\nTunggu 30 detik, kalau aman tekan lagi", g_step, kHookTotal, nm);
+            else snprintf(b, sizeof b, "Hook %d/%d GAGAL: %s", g_step, kHookTotal, nm);
+            showToast(env, obj, b);
+            break;
+        }
+        case 10:
+        case 11: {
             resolveOutDir(env, obj);
-            const char *summary = nullptr;
-            fileLog("tombol Siapkan ditekan: mulai memasang 8 hook");
-            int result = installAll(&summary);
-
-            char msg[256];
-            if (result == -1) {
-                snprintf(msg, sizeof msg, "%s", summary ? summary : "libil2cpp belum termuat");
-            } else {
-                pending.fetch_or(3);
-                snprintf(msg, sizeof msg, "%s. Dump inventory + database dijadwalkan. %s",
-                         summary ? summary : "Hook selesai",
-                         g_tick.load() ? "Menunggu objek tertangkap." : "Menunggu Tick game berjalan.");
-            }
-            showToast(env, obj, msg);
+            pending |= (featNum == 10 ? 1 : 2);
+            char b[512];
+            snprintf(b, sizeof b, "%s diminta%s\nHasil: %s", featNum == 10 ? "Dump inventory" : "Dump database",
+                     g_tick.load() ? "" : " (hook Tick belum aktif: tekan Siapkan dulu & pastikan sudah di dalam game)",
+                     outDir().c_str());
+            showToast(env, obj, b);
+            LOGI(OBFUSCATE("tombol dump ditekan: %d"), (int) featNum);
             break;
         }
-        case 3: {   // tombol Tambahkan UID
-            std::string uid = getManualUid();
-            int cnt = getManualAmount();
-            if (uid.empty()) {
-                showToast(env, obj, "UID masih kosong. Isi di menu dulu.");
-                fileLog("add: ditolak, uid kosong");
-                break;
+        case 12: {
+            resolveOutDir(env, obj);
+            char b[640];
+            int nc;
+            size_t nu;
+            std::string last, am;
+            {
+                std::lock_guard<std::mutex> lk(gMtx);
+                nc = g_nc;
+                nu = seenUids.size();
+                last = g_lastFile;
+                am = g_addMsg;
             }
-            pending.fetch_or(4);
-            char msg[224];
-            snprintf(msg, sizeof msg, "Dijadwalkan: %d x %s", cnt, uid.c_str());
-            showToast(env, obj, msg);
-            fileLog("permintaan tambah UID dijadwalkan: uid=%s jumlah=%d", uid.c_str(), cnt);
+            snprintf(b, sizeof b, "hook=%d/%d tick=%d pbm=%d db=%d kontainer=%d uid=%zu dump=%d baris=%d\nadd: %s\nfile: %s",
+                     hookCount(), kHookTotal, g_tick.load() ? 1 : 0,
+                     (g_pbm.load() || g_pbmFree.load() || g_pbmAmt.load()) ? 1 : 0,
+                     g_db.load() ? 1 : 0, nc, nu, g_dumps.load(), g_rows.load(),
+                     am.c_str(),
+                     last.empty() ? outDir().c_str() : last.c_str());
+            showToast(env, obj, b);
+            LOGI(OBFUSCATE("status: %s"), b);
             break;
         }
-        case 4: {   // tombol Refresh daftar item
-            if (!g_pbm.load() && !g_pbmFree.load() && !g_pbmAmt.load()) {
-                showToast(env, obj, "Tas belum tertangkap. Buka inventory dulu.");
-                fileLog("refresh: ditolak, tas belum tertangkap");
-                break;
-            }
-            pending.fetch_or(16);
-            showToast(env, obj, "Refresh daftar item dijadwalkan. Lihat inv_items.txt");
-            fileLog("refresh: dijadwalkan");
+        case 13:
+            g_selIdx = value;
+            fileLog("pilih item idx=%d", (int) value);
+            break;
+        case 14:
+            g_addCount = value < 1 ? 1 : value;
+            break;
+        case 15: {
+            int idx = g_selIdx.load();
+            if (idx < 0 || idx >= kItemCount) idx = 0;
+            pending |= 4;
+            char b[256];
+            snprintf(b, sizeof b, "Tambah %d x %s diminta%s", g_addCount.load(), kItems[idx].label,
+                     g_tick.load() ? "" : "\n(hook Tick belum aktif: tekan Siapkan sampai selesai)");
+            showToast(env, obj, b);
             break;
         }
-        case 7: {   // tombol Ubah jumlah item
-            if (getEditIndex() < 1) {
-                showToast(env, obj, "Index item belum diisi. Lihat inv_items.txt lalu isi field Index.");
-                fileLog("edit: ditolak, index kosong");
-                break;
+        case 16: {
+            if (text) {
+                const char *c = env->GetStringUTFChars(text, nullptr);
+                if (c) {
+                    std::string t(c);
+                    env->ReleaseStringUTFChars(text, c);
+                    while (!t.empty() && (t.back() == ' ' || t.back() == '\n' || t.back() == '\r')) t.pop_back();
+                    size_t b = 0;
+                    while (b < t.size() && t[b] == ' ') b++;
+                    t = t.substr(b);
+                    std::lock_guard<std::mutex> lk(gMtx);
+                    g_manualUid = t;
+                }
             }
-            pending.fetch_or(8);
-            char msg[160];
-            snprintf(msg, sizeof msg, "Dijadwalkan: item #%d -> %d", getEditIndex(), getEditAmount());
-            showToast(env, obj, msg);
-            fileLog("edit: dijadwalkan idx=%d amt=%d", getEditIndex(), getEditAmount());
             break;
         }
-        default:
+        case 17: {
+            std::string u;
+            { std::lock_guard<std::mutex> lk(gMtx); u = g_manualUid; }
+            pending |= 8;
+            char b[256];
+            snprintf(b, sizeof b, "Tes uid manual '%s' x %d diminta%s", u.c_str(), g_addCount.load(),
+                     g_tick.load() ? "" : "\n(hook Tick belum aktif: tekan Siapkan sampai selesai)");
+            showToast(env, obj, b);
             break;
+        }
+        default: break;
     }
 }
-
-// ======================= ENTRY =======================
 
 void hack_thread() {
     while (!isLibraryLoaded(targetLibName)) {
